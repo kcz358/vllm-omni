@@ -12,7 +12,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.core.sched.utils import remove_all
-from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
@@ -566,18 +566,68 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
         """
-        Override: Only extend prompt at stage 0, and replace
-        the existing session with the next streaming update at other stages.
+        Override: handle streaming input differently for each pipeline stage.
 
-        Discards the last sampled output token from the prior input chunk at stage 0.
+        - stage > 0 (cross-stage hand-off, e.g. AR thinker → audio generator):
+          full session reset via ``_replace_session_with_streaming_update``
+          (prompt rewritten, ``num_computed_tokens=0``, KV recomputed).
+
+        - stage == 0 (streaming-input prefix, e.g. realtime audio/video
+          chunks feeding the front-end LM): KV must be reused across chunks
+          (we don't want to re-prefill every time a new audio frame arrives),
+          but vLLM's native streaming append leaves the previously sampled
+          output token glued onto ``_all_token_ids`` between chunks. That
+          dangling tail breaks any per-chunk side-channel that must be
+          aligned 1:1 with ``input_ids`` (e.g. aero-realtime's
+          ``text_stream_ids``).
+
+          So at stage 0 we do an *append-only* update on the prompt side
+          (keep ``num_computed_tokens``, drop the sampled tail), and
+          fully overwrite ``additional_information`` with the incoming
+          delta -- giving the worker a session whose
+          ``_all_token_ids[num_computed_tokens:]`` slice is exactly the
+          new chunk, lined up with the freshly delivered side-channel.
+
+          Discards the last sampled output token from the prior input chunk
+          at stage 0.
         """
         req_id = session.request_id
         self._new_prompt_len_snapshot[req_id] = len(update.prompt_token_ids)
         if self.vllm_config.model_config.stage_id != 0:
             self._replace_session_with_streaming_update(session, update)
+            return
 
-        else:
-            super()._update_request_as_session(session, update)
+        # ----- stage 0: append-only prompt update with sampled-tail drop ----
+        # Drop sampled-output tail and anything past the prior prompt: the
+        # next chunk is meant to be glued onto the prompt boundary, not onto
+        # whatever the model sampled internally.
+        session._output_token_ids.clear()
+        prior_prompt = tuple(session.prompt_token_ids or ())
+        session._all_token_ids.clear()
+        session._all_token_ids.extend(prior_prompt)
+
+        new_prompt = tuple(update.prompt_token_ids or ())
+        session._all_token_ids.extend(new_prompt)
+        session.prompt_token_ids = prior_prompt + new_prompt
+        session.num_prompt_tokens = len(session.prompt_token_ids)
+        # ``num_computed_tokens`` is preserved on purpose: KV for the prior
+        # prompt prefix is still valid, the worker will only prefill the
+        # newly appended ``new_prompt`` tokens.
+
+        # Overwrite side-channel with this chunk's payload. Models that
+        # don't use ``additional_information`` send ``None`` here, which
+        # cleanly resets to ``None`` (matches what super() would have done).
+        session.additional_information = update.additional_information
+
+        session.update_block_hashes()
+        session.arrival_time = update.arrival_time
+        session.sampling_params = update.sampling_params
+        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+            self.num_waiting_for_streaming_input -= 1
+        session.status = RequestStatus.WAITING
+
+        if self.log_stats:
+            session.record_event(EngineCoreEventType.QUEUED)
 
     def _free_request(self, request: Request, delay_free_blocks: bool = False) -> dict[str, Any] | None:
         # TODO(wzliu)! for offline mode, we should not end process until all data is transferred

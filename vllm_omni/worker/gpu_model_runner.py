@@ -1486,33 +1486,58 @@ class OmniGPUModelRunner(GPUModelRunner):
         return self._update_intermediate_buffer(req_id, upd)
 
     def _update_streaming_input_additional_info(self, new_req_data, req_id):
-        # For streaming input prefill case only. Update buffer from last segment input
+        # For streaming input prefill case only. Update buffer from last segment input.
+        #
+        # Behaviour depends on pipeline stage:
+        #
+        # - stage > 0 (cross-stage hand-off): keys listed in
+        #   ``streaming_accumulated_keys`` are concatenated chunk-by-chunk
+        #   (intended for cumulative timelines), and ``num_processed_tokens``
+        #   is reset because the scheduler-side ``_replace_session_with_streaming_update``
+        #   fully rebuilds the session (KV cleared, ``num_computed_tokens=0``)
+        #   -- the model's per-request cursor must restart from 0 to stay in sync.
+        #
+        # - stage == 0 (streaming-input prefix, e.g. realtime audio/video):
+        #   the scheduler does an append-only prompt update with the sampled
+        #   tail dropped, so ``input_ids`` for this forward step contains
+        #   exactly the new chunk. Any side-channel payload (e.g.
+        #   ``text_stream_ids``) must align 1:1 with that chunk, so we
+        #   overwrite the buffer with the latest delta instead of concatenating.
         cached_additional_info = self.model_intermediate_buffer.get(req_id, {})
-        if cached_additional_info:
-            payload_info = getattr(new_req_data, "additional_information", None)
-            inc_info = deserialize_additional_information(payload_info)
-            if isinstance(inc_info, dict) and inc_info:
-                accumulated_keys: set[tuple[str, str]] = set()
-                if hasattr(self, "model") and hasattr(self.model, "streaming_accumulated_keys"):
-                    accumulated_keys = self.model.streaming_accumulated_keys
-                merged_info = dict(cached_additional_info)
-                for key, value in inc_info.items():
-                    if isinstance(value, dict):
-                        existing_sub = merged_info.get(key)
-                        merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
-                        for sk, sv in value.items():
-                            if (key, sk) in accumulated_keys and isinstance(sv, torch.Tensor):
-                                inc_tensor = sv.detach().to("cpu").contiguous()
-                                old_tensor = merged_sub.get(sk)
-                                if old_tensor is None:
-                                    merged_sub[sk] = inc_tensor
-                                else:
-                                    merged_sub[sk] = torch.cat((old_tensor, inc_tensor), dim=0)
+        if not cached_additional_info:
+            return
+
+        payload_info = getattr(new_req_data, "additional_information", None)
+        inc_info = deserialize_additional_information(payload_info)
+        if not (isinstance(inc_info, dict) and inc_info):
+            return
+
+        if self.vllm_config.model_config.stage_id == 0:
+            # stage 0: every chunk is self-contained, overwrite latest.
+            merged_info = dict(inc_info)
+        else:
+            accumulated_keys: set[tuple[str, str]] = set()
+            if hasattr(self, "model") and hasattr(self.model, "streaming_accumulated_keys"):
+                accumulated_keys = self.model.streaming_accumulated_keys
+            merged_info = dict(cached_additional_info)
+            for key, value in inc_info.items():
+                if isinstance(value, dict):
+                    existing_sub = merged_info.get(key)
+                    merged_sub = dict(existing_sub) if isinstance(existing_sub, dict) else {}
+                    for sk, sv in value.items():
+                        if (key, sk) in accumulated_keys and isinstance(sv, torch.Tensor):
+                            inc_tensor = sv.detach().to("cpu").contiguous()
+                            old_tensor = merged_sub.get(sk)
+                            if old_tensor is None:
+                                merged_sub[sk] = inc_tensor
                             else:
-                                merged_sub[sk] = sv
-                        merged_info[key] = merged_sub
-                    else:
-                        merged_info[key] = value
-                merged_info.setdefault("meta", {})["num_processed_tokens"] = 0
-                self.model_intermediate_buffer[req_id] = merged_info
-                setattr(self.requests[req_id], "additional_information_cpu", merged_info)
+                                merged_sub[sk] = torch.cat((old_tensor, inc_tensor), dim=0)
+                        else:
+                            merged_sub[sk] = sv
+                    merged_info[key] = merged_sub
+                else:
+                    merged_info[key] = value
+            merged_info.setdefault("meta", {})["num_processed_tokens"] = 0
+
+        self.model_intermediate_buffer[req_id] = merged_info
+        setattr(self.requests[req_id], "additional_information_cpu", merged_info)
