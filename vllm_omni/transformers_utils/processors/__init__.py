@@ -10,3 +10,4 @@ __all__ = [
     "MingFlashOmniProcessor",
     "MingWhisperFeatureExtractor",
 ]
+from vllm_omni.transformers_utils.processors import aero_realtime as _aero_realtime  # noqa: F401

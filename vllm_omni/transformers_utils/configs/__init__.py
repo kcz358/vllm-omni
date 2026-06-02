@@ -20,6 +20,8 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "VoxCPMConfig": "vllm_omni.transformers_utils.configs.voxcpm",
     "VoxCPM2Config": "vllm_omni.transformers_utils.configs.voxcpm2",
     "VoxtralTTSConfig": "vllm_omni.transformers_utils.configs.voxtral_tts",
+    "AeroRealtimeConfig": "vllm_omni.transformers_utils.configs.aero_realtime",
+    "AeroRealtimeAudioEncoderConfig": "vllm_omni.transformers_utils.configs.aero_realtime",
     "BailingMoeV2Config": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "BailingMM2Config": "vllm_omni.transformers_utils.configs.ming_flash_omni",
     "MingFlashOmniConfig": "vllm_omni.transformers_utils.configs.ming_flash_omni",
@@ -38,6 +40,8 @@ __all__ = [
     "VoxCPMConfig",
     "VoxCPM2Config",
     "VoxtralTTSConfig",
+    "AeroRealtimeConfig",
+    "AeroRealtimeAudioEncoderConfig",
     "BailingMoeV2Config",
     "BailingMM2Config",
     "MingFlashOmniConfig",
@@ -67,3 +71,4 @@ from vllm_omni.transformers_utils.configs import ming_flash_omni as _ming_flash_
 from vllm_omni.transformers_utils.configs import voxcpm as _voxcpm  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxcpm2 as _voxcpm2  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import voxtral_tts as _voxtral_tts  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import aero_realtime as _aero_realtime  # noqa: F401, E402
