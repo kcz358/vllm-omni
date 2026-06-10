@@ -214,7 +214,8 @@ class AeroRealtimeMultiModalProcessor(Qwen3VLMultiModalProcessor):
             if feature_attention_mask is not None:
                 fam_t = torch.as_tensor(feature_attention_mask)
                 hf_processor = self.info.get_hf_processor(**mm_kwargs)
-                if getattr(hf_processor, "chunk_audio", False):
+                is_chunked = getattr(hf_processor, "chunk_audio", False)
+                if is_chunked:
                     b = len(audios)
                     if b > 0 and fam_t.shape[0] % b == 0:
                         n_padded = fam_t.shape[0] // b
@@ -224,8 +225,8 @@ class AeroRealtimeMultiModalProcessor(Qwen3VLMultiModalProcessor):
                         hf_inputs["input_features"] = feats_t[chunk_valid]
                         hf_inputs["feature_attention_mask"] = fam_t[chunk_valid]
                         hf_inputs["audio_chunks_per_item"] = n_per_item
-                        fam_t = hf_inputs["feature_attention_mask"]
-                hf_inputs["audio_feature_lengths"] = fam_t.sum(-1)
+                else:
+                    hf_inputs["audio_feature_lengths"] = fam_t.sum(-1)
             return hf_inputs
 
         hf_inputs = super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
