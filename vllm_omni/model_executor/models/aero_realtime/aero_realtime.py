@@ -556,24 +556,21 @@ class AeroRealtimeForConditionalGeneration(
     ) -> tuple[int, int]:
         """Compute (num_audio_lm_tokens, num_mel_frames) for one audio chunk.
 
-        Mirrors the lmms-engine reference processor: feature extractor runs
-        with ``padding="longest"`` (Voxtral FE has no default max_length),
-        ``mel_frames`` is read from the FE attention mask, and the LM-side
-        audio token count is ``mel_frames // audio_length_per_tok``
-        (= ``mel // (2 * downsample_factor)``).
+        Closed-form mel_frames derivation so we don't run the FE STFT for every
+        80ms chunk (~45k calls per 1h video). Voxtral FE uses
+        ``attention_mask[:, win_length-1::hop_length]`` to get mel_frames, and
+        with ``padding="longest"`` no padding happens, so this reduces to
+        ``mel = (n_samples - win_length) // hop_length + 1`` (or 0 if shorter).
+        Verified numerically equivalent to the FE for arbitrary chunk lengths.
         """
         feature_extractor = processor.feature_extractor
-        audio_inputs = feature_extractor(
-            [audio_chunk],
-            sampling_rate=sampling_rate,
-            return_attention_mask=True,
-            padding="longest",
-        )
-        feature_attention_mask = torch.as_tensor(audio_inputs["attention_mask"])
-        mel_frames = int(feature_attention_mask.sum(-1)[0].item())
-        # Match the chunked processor: it pads mel to a multiple of
-        # ``audio_length_per_tok`` before splitting into LM-token rows, so
-        # use ceil-div here too.
+        win_length = int(getattr(feature_extractor, "win_length", 400))
+        hop_length = int(getattr(feature_extractor, "hop_length", 160))
+        n_samples = int(np.asarray(audio_chunk).shape[-1])
+        if n_samples < win_length:
+            mel_frames = 0
+        else:
+            mel_frames = (n_samples - win_length) // hop_length + 1
         chunk_mel = int(processor.audio_length_per_tok)
         num_audio_tokens = (mel_frames + chunk_mel - 1) // chunk_mel
         return num_audio_tokens, mel_frames
