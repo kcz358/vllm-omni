@@ -171,8 +171,18 @@ def _aero_field_config(hf_inputs: Mapping[str, torch.Tensor]):
         if "timestamps" in hf_inputs:
             config["timestamps"] = MultiModalFieldConfig.batched("video")
     if "input_features" in hf_inputs:
-        config["input_features"] = MultiModalFieldConfig.batched("audio")
-        config["feature_attention_mask"] = MultiModalFieldConfig.batched("audio")
+        chunks_per_item = hf_inputs.get("audio_chunks_per_item")
+        if chunks_per_item is not None:
+            config["input_features"] = MultiModalFieldConfig.flat_from_sizes(
+                "audio", chunks_per_item
+            )
+            config["feature_attention_mask"] = MultiModalFieldConfig.flat_from_sizes(
+                "audio", chunks_per_item
+            )
+            config["audio_chunks_per_item"] = MultiModalFieldConfig.batched("audio")
+        else:
+            config["input_features"] = MultiModalFieldConfig.batched("audio")
+            config["feature_attention_mask"] = MultiModalFieldConfig.batched("audio")
         if audio_feature_lengths is not None:
             config["audio_feature_lengths"] = MultiModalFieldConfig.batched("audio")
     return config
@@ -202,7 +212,20 @@ class AeroRealtimeMultiModalProcessor(Qwen3VLMultiModalProcessor):
             )
             feature_attention_mask = hf_inputs.get("feature_attention_mask")
             if feature_attention_mask is not None:
-                hf_inputs["audio_feature_lengths"] = torch.as_tensor(feature_attention_mask).sum(-1)
+                fam_t = torch.as_tensor(feature_attention_mask)
+                hf_processor = self.info.get_hf_processor(**mm_kwargs)
+                if getattr(hf_processor, "chunk_audio", False):
+                    b = len(audios)
+                    if b > 0 and fam_t.shape[0] % b == 0:
+                        n_padded = fam_t.shape[0] // b
+                        chunk_valid = fam_t.any(dim=-1)
+                        n_per_item = chunk_valid.view(b, n_padded).sum(dim=-1).to(torch.long)
+                        feats_t = torch.as_tensor(hf_inputs["input_features"])
+                        hf_inputs["input_features"] = feats_t[chunk_valid]
+                        hf_inputs["feature_attention_mask"] = fam_t[chunk_valid]
+                        hf_inputs["audio_chunks_per_item"] = n_per_item
+                        fam_t = hf_inputs["feature_attention_mask"]
+                hf_inputs["audio_feature_lengths"] = fam_t.sum(-1)
             return hf_inputs
 
         hf_inputs = super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
@@ -273,10 +296,11 @@ class AeroRealtimeMultiModalProcessor(Qwen3VLMultiModalProcessor):
         # Post-conv2 lengths per sample; LM token count = T_enc // df.
         downsample_factor = self.info.get_hf_config().downsample_factor
         is_chunked = getattr(hf_processor, "chunk_audio", False)
-        if is_chunked and feature_attention_mask is not None:
-            # Chunked schema: one row per LM audio token. Each item has
-            # ``fam.shape[0] / B`` LM tokens; encode that as T_enc = N * df
-            # so the downstream ``// df`` recovers N.
+        chunks_per_item = out_mm_data.get("audio_chunks_per_item")
+        if is_chunked and chunks_per_item is not None:
+            n_per_item_t = torch.as_tensor(chunks_per_item)
+            audio_output_lens = n_per_item_t.to(torch.long) * downsample_factor
+        elif is_chunked and feature_attention_mask is not None:
             fam = torch.as_tensor(feature_attention_mask)
             b = mm_items.get_count("audio")
             n_per_item = fam.shape[0] // b
