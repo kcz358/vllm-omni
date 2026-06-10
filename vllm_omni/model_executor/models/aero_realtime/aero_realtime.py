@@ -71,6 +71,7 @@ logger = init_logger(__name__)
 class AeroRealtimeAudioFeatureInputs(Qwen2AudioFeatureInputs):
     input_features: Annotated[torch.Tensor | list[torch.Tensor], TensorShape("na", "nmb", "t_mel")]
     feature_attention_mask: Annotated[torch.Tensor, TensorShape("na", "t_enc")]
+    audio_chunks_per_item: Annotated[torch.Tensor | None, TensorShape("n")] = None
 
 
 class AeroRealtimeMultiModalProjector(nn.Module):
@@ -201,32 +202,53 @@ class AeroRealtimeMultiModalProcessor(Qwen3VLMultiModalProcessor):
 
         if audios:
             hf_inputs = super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
-            audio_inputs = self.info.ctx.call_hf_processor(
-                self.info.get_hf_processor(**mm_kwargs),
-                dict(text="", audio=audios),
+            hf_processor = self.info.get_hf_processor(**mm_kwargs)
+            sr = hf_processor.feature_extractor.sampling_rate
+
+            short_idx, long_idx = [], []
+            for i, a in enumerate(audios):
+                n_tok, _ = AeroRealtimeForConditionalGeneration._get_audio_token_count(hf_processor, a, sr)
+                (short_idx if n_tok <= 1 else long_idx).append(i)
+
+            short_out = self.info.ctx.call_hf_processor(
+                hf_processor,
+                dict(text="", audio=[audios[i] for i in short_idx]),
                 dict(**mm_kwargs, **tok_kwargs),
-            )
-            hf_inputs["input_features"] = audio_inputs["input_features"]
-            hf_inputs["feature_attention_mask"] = audio_inputs.get(
-                "feature_attention_mask", audio_inputs.get("audio_attention_mask")
-            )
-            feature_attention_mask = hf_inputs.get("feature_attention_mask")
-            if feature_attention_mask is not None:
-                fam_t = torch.as_tensor(feature_attention_mask)
-                hf_processor = self.info.get_hf_processor(**mm_kwargs)
-                is_chunked = getattr(hf_processor, "chunk_audio", False)
-                if is_chunked:
-                    b = len(audios)
-                    if b > 0 and fam_t.shape[0] % b == 0:
-                        n_padded = fam_t.shape[0] // b
-                        chunk_valid = fam_t.any(dim=-1)
-                        n_per_item = chunk_valid.view(b, n_padded).sum(dim=-1).to(torch.long)
-                        feats_t = torch.as_tensor(hf_inputs["input_features"])
-                        hf_inputs["input_features"] = feats_t[chunk_valid]
-                        hf_inputs["feature_attention_mask"] = fam_t[chunk_valid]
-                        hf_inputs["audio_chunks_per_item"] = n_per_item
-                else:
-                    hf_inputs["audio_feature_lengths"] = fam_t.sum(-1)
+            ) if short_idx else None
+            long_out = self.info.ctx.call_hf_processor(
+                hf_processor,
+                dict(text="", audio=[audios[i] for i in long_idx]),
+                dict(**mm_kwargs, **tok_kwargs),
+            ) if long_idx else None
+
+            is_chunked = getattr(hf_processor, "chunk_audio", False)
+
+            per_item_feats: list[torch.Tensor] = [None] * len(audios)
+            per_item_fam: list[torch.Tensor] = [None] * len(audios)
+            per_item_chunks: list[int] = [0] * len(audios)
+
+            for idxs, out in ((short_idx, short_out), (long_idx, long_out)):
+                if out is None:
+                    continue
+                feats = torch.as_tensor(out["input_features"])
+                fam = torch.as_tensor(out.get("feature_attention_mask", out["audio_attention_mask"]))
+                b = len(idxs)
+                n_padded = fam.shape[0] // b
+                chunk_valid = fam.any(dim=-1).view(b, n_padded)
+                feats = feats.view(b, n_padded, *feats.shape[1:])
+                fam = fam.view(b, n_padded, fam.shape[-1])
+                for j, idx in enumerate(idxs):
+                    valid = chunk_valid[j]
+                    per_item_feats[idx] = feats[j][valid]
+                    per_item_fam[idx] = fam[j][valid]
+                    per_item_chunks[idx] = int(valid.sum().item())
+
+            hf_inputs["input_features"] = torch.cat(per_item_feats, dim=0)
+            hf_inputs["feature_attention_mask"] = torch.cat(per_item_fam, dim=0)
+            if is_chunked:
+                hf_inputs["audio_chunks_per_item"] = torch.as_tensor(per_item_chunks, dtype=torch.long)
+            else:
+                hf_inputs["audio_feature_lengths"] = hf_inputs["feature_attention_mask"].sum(-1)
             return hf_inputs
 
         hf_inputs = super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
@@ -851,12 +873,14 @@ class AeroRealtimeForConditionalGeneration(
     def _parse_and_validate_audio_input(self, **kwargs: object) -> AeroRealtimeAudioFeatureInputs | None:
         input_features = kwargs.pop("input_features", None)
         feature_attention_mask = kwargs.pop("feature_attention_mask", None)
+        audio_chunks_per_item = kwargs.pop("audio_chunks_per_item", None)
         if input_features is None:
             return None
         return AeroRealtimeAudioFeatureInputs(
             type="audio_features",
             input_features=input_features,
             feature_attention_mask=feature_attention_mask,
+            audio_chunks_per_item=audio_chunks_per_item,
         )
 
     def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict[str, object]:
@@ -884,8 +908,8 @@ class AeroRealtimeForConditionalGeneration(
         along the hidden dim and project to LM hidden size.
         """
         input_features = audio_input["input_features"]
+        chunks_per_item = audio_input.get("audio_chunks_per_item")
         conv_dtype = self.audio_tower.conv1.weight.dtype
-        # Track per-item row counts for splitting output back per audio item.
         per_item_sizes: list[int] | None = None
         if isinstance(input_features, (list, tuple)):
             per_item_sizes = [int(t.shape[0]) for t in input_features]
@@ -896,8 +920,10 @@ class AeroRealtimeForConditionalGeneration(
                 per_item_sizes = [int(x.shape[1])] * int(x.shape[0])
                 x = x.reshape(-1, x.shape[-2], x.shape[-1])
             elif x.ndim == 3:
-                # Chunked schema: 1 row == 1 LM audio token == 1 item.
-                per_item_sizes = [1] * int(x.shape[0])
+                if chunks_per_item is not None:
+                    per_item_sizes = torch.as_tensor(chunks_per_item).reshape(-1).tolist()
+                else:
+                    per_item_sizes = [1] * int(x.shape[0])
         if x.shape[0] == 0:
             lm_hidden = self.config.text_config.hidden_size
             return (input_features.new_zeros((0, lm_hidden)),)
