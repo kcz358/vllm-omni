@@ -1874,8 +1874,8 @@ async def main():
             model="/data/v-kaichen/azure_blob/output/aero_realtime_omni_qwen3vl_4b_qwen3tts_0_6b_1x4_a100_80g_lr1e_4_cosine",
             deploy_config="vllm_omni/deploy/aero_realtime_omni.yaml",
             log_stats=False,
-            gpu_memory_utilization=0.9,
             skip_mm_profiling=True,
+            max_model_len=32768,
         )
         print("OK — all 3 stages loaded")
     except Exception as e:
@@ -2007,10 +2007,20 @@ audio delta stream to a 24 kHz WAV file.
                 print(f"[audio] delta samples={audio_np.reshape(-1).shape[0]}")
 ```
 
-**Edit D:** immediately before the `try:` block in `main()`, initialize `_audio_chunks`:
+**Edit D:** immediately before the `try:` block in `main()`, replace the single-stage SamplingParams construction with a 3-stage-aware `None` (AsyncOmni will pull each stage's `default_sampling_params` from the yaml and auto-coerce stage 0 to DELTA + skip_clone via `allow_delta_coercion=True`). Also initialize `_audio_chunks`:
 
 `oldString`:
 ```python
+    sampling_params = SamplingParams(
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        seed=args.seed,
+        max_tokens=1,
+        output_kind=RequestOutputKind.DELTA,
+        skip_clone=True,
+    )
+
     request_id = f"aero-rt-debug-{uuid.uuid4()}"
     input_stream: asyncio.Queue[list[int]] = asyncio.Queue()
 
@@ -2019,6 +2029,12 @@ audio delta stream to a 24 kHz WAV file.
 
 `newString`:
 ```python
+    # Use the per-stage default_sampling_params from the deploy yaml; AsyncOmni
+    # auto-coerces stage-0 output_kind to DELTA + skip_clone via
+    # allow_delta_coercion=True. Advanced overrides can be added by
+    # constructing a length-num_stages list here.
+    sampling_params_list = None
+
     request_id = f"aero-rt-omni-debug-{uuid.uuid4()}"
     input_stream: asyncio.Queue[list[int]] = asyncio.Queue()
     _audio_chunks: list[np.ndarray] = []
@@ -2026,7 +2042,7 @@ audio delta stream to a 24 kHz WAV file.
     try:
 ```
 
-**Edit E:** after the `finally: await omni.abort(request_id)` line, add WAV writing.
+**Edit E:** update the `omni.generate` call to use `sampling_params_list` and add WAV writing on finally. Locate:
 
 `oldString`:
 ```python

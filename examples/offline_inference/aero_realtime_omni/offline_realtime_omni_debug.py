@@ -237,7 +237,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=None)
     parser.add_argument("--tensor-parallel-size", type=int, default=None)
     parser.add_argument("--stage-0-devices", default=None)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=None,
+                        help="Global override. Leave unset to let deploy yaml drive per-stage utilization.")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=-1)
@@ -255,9 +256,10 @@ def build_async_omni(args: argparse.Namespace) -> AsyncOmni:
         "model": args.model,
         "deploy_config": args.deploy_config,
         "log_stats": False,
-        "gpu_memory_utilization": args.gpu_memory_utilization,
         "skip_mm_profiling": args.skip_mm_profiling,
     }
+    if args.gpu_memory_utilization is not None:
+        kwargs["gpu_memory_utilization"] = args.gpu_memory_utilization
     if args.max_model_len is not None:
         kwargs["max_model_len"] = args.max_model_len
     if args.tensor_parallel_size is not None:
@@ -276,15 +278,11 @@ async def main() -> None:
     omni = build_async_omni(args)
     tokenizer = cached_tokenizer_from_config(omni.model_config)
 
-    sampling_params = SamplingParams(
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
-        seed=args.seed,
-        max_tokens=1,
-        output_kind=RequestOutputKind.DELTA,
-        skip_clone=True,
-    )
+    # Use the per-stage default_sampling_params from the deploy yaml; AsyncOmni
+    # auto-coerces stage-0 output_kind to DELTA + skip_clone via
+    # allow_delta_coercion=True. Advanced overrides can be added by
+    # constructing a length-num_stages list here.
+    sampling_params_list = None
 
     request_id = f"aero-rt-omni-debug-{uuid.uuid4()}"
     input_stream: asyncio.Queue[list[int]] = asyncio.Queue()
@@ -301,7 +299,7 @@ async def main() -> None:
                 verbose=args.verbose,
             ),
             request_id=request_id,
-            sampling_params_list=[sampling_params],
+            sampling_params_list=sampling_params_list,
         ):
             if not output.outputs:
                 continue
