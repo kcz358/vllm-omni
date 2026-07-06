@@ -93,6 +93,7 @@ class AeroRealtimeTalkerCodePredictorConfig(PretrainedConfig):
         initializer_range: float = 0.02,
         use_cache: bool = True,
         pad_token_id: int = 0,
+        tie_word_embeddings: bool = False,
         layer_types: list | None = None,
         **kwargs,
     ):
@@ -109,6 +110,10 @@ class AeroRealtimeTalkerCodePredictorConfig(PretrainedConfig):
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.rope_theta = rope_theta
+        # transformers 5.x: `rope_scaling` is a property alias for `rope_parameters`
+        # (see transformers/configuration_utils.py:482-488). Writing to both would be
+        # a no-op at best. Store only `rope_parameters`; reads of `.rope_scaling`
+        # transparently return the same dict via the property.
         if rope_parameters is not None:
             self.rope_parameters = rope_parameters
         else:
@@ -118,7 +123,7 @@ class AeroRealtimeTalkerCodePredictorConfig(PretrainedConfig):
         self.initializer_range = initializer_range
         self.use_cache = use_cache
         self.layer_types = layer_types if layer_types is not None else ["full_attention"] * num_hidden_layers
-        super().__init__(pad_token_id=pad_token_id, **kwargs)
+        super().__init__(pad_token_id=pad_token_id, tie_word_embeddings=tie_word_embeddings, **kwargs)
 
 
 class AeroRealtimeTalkerConfig(PretrainedConfig):
@@ -155,6 +160,7 @@ class AeroRealtimeTalkerConfig(PretrainedConfig):
         initializer_range: float = 0.02,
         use_cache: bool = True,
         pad_token_id: int = 0,
+        tie_word_embeddings: bool = False,
         code_predictor_config=None,
         **kwargs,
     ):
@@ -177,6 +183,8 @@ class AeroRealtimeTalkerConfig(PretrainedConfig):
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.rope_theta = rope_theta
+        # See note above: only `rope_parameters` is stored; `rope_scaling` is a
+        # transformers 5.x property alias.
         if rope_parameters is not None:
             self.rope_parameters = rope_parameters
         elif rope_scaling is not None:
@@ -200,7 +208,7 @@ class AeroRealtimeTalkerConfig(PretrainedConfig):
         self.speaker_id = speaker_id if speaker_id is not None else {"ryan": 3061}
         self.initializer_range = initializer_range
         self.use_cache = use_cache
-        super().__init__(pad_token_id=pad_token_id, **kwargs)
+        super().__init__(pad_token_id=pad_token_id, tie_word_embeddings=tie_word_embeddings, **kwargs)
 
 
 class AeroRealtimeOmniConfig(PretrainedConfig):
@@ -392,12 +400,16 @@ def forward(
 
 - [ ] **Step 4: Add `make_omni_output`**
 
-Immediately after the modified `forward` (before `compute_logits` at what is currently line 1118) insert:
+Add a module-level import of `OmniOutput` near the other `vllm_omni` imports at the top of the file (immediately after `from vllm_omni.inputs.data import OmniTokensPrompt`):
+
+```python
+from vllm_omni.model_executor.models.output_templates import OmniOutput
+```
+
+Then immediately after the modified `forward` (before `compute_logits` at what is currently line 1118) insert:
 
 ```python
 def make_omni_output(self, model_outputs, **kwargs):
-    from vllm_omni.model_executor.models.output_templates import OmniOutput
-
     if isinstance(model_outputs, OmniOutput):
         return model_outputs
     if isinstance(model_outputs, tuple) and len(model_outputs) == 2:
@@ -406,7 +418,11 @@ def make_omni_output(self, model_outputs, **kwargs):
             text_hidden_states=hidden.reshape(-1, hidden.shape[-1]),
             multimodal_outputs=captured,
         )
-    # Non-omni mode: hidden only, no captured payload.
+    if not isinstance(model_outputs, torch.Tensor):
+        raise TypeError(
+            f"AeroRealtime.make_omni_output expected torch.Tensor, OmniOutput, "
+            f"or 2-tuple; got {type(model_outputs).__name__}"
+        )
     return OmniOutput(
         text_hidden_states=model_outputs.reshape(-1, model_outputs.shape[-1]),
         multimodal_outputs=None,
@@ -423,8 +439,7 @@ def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
 
 Change to:
 ```python
-def compute_logits(self, hidden_states) -> torch.Tensor | None:
-    from vllm_omni.model_executor.models.output_templates import OmniOutput
+def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
     if isinstance(hidden_states, OmniOutput):
         hidden_states = hidden_states.text_hidden_states
     return self.language_model.compute_logits(hidden_states)
@@ -435,13 +450,47 @@ def compute_logits(self, hidden_states) -> torch.Tensor | None:
 Add after `make_omni_output`:
 
 ```python
-def postprocess(self, hidden_states, **info_dict):
+def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
     # Thinker stage 0 has no cross-step state to save on the producer side; the
     # talker stage (1) does its own state management from the accumulated payload.
     return {}
 ```
 
-- [ ] **Step 7: Smoke check — thinker still constructible**
+- [ ] **Step 7: Add `lm_head` prefix rule to `hf_to_vllm_mapper`**
+
+The Qwen3-VL `Qwen3LLMForCausalLM` stores its LM head at `self.language_model.lm_head`,
+but the aero checkpoint has `thinker.lm_head.weight` at top level (post-`thinker.`-strip
+this becomes `lm_head.weight`). The existing mapper doesn't rewrite this. Add ONE new
+entry at the **bottom** of `orig_to_new_prefix` (order matters — `WeightsMapper._map_name`
+applies rules in insertion order, so putting it before the `language_model.` rule would
+cause a double rewrite):
+
+Locate the mapper (currently ~lines 373-391):
+
+```python
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.language_model.": "language_model.model.",
+            "language_model.": "language_model.model.",
+            "model.vision_tower.": "visual.",
+            "vision_tower.": "visual.",
+            "model.multi_modal_projector.": "multi_modal_projector.",
+            "model.audio_tower.embedder.": "audio_tower.",
+            "audio_tower.embedder.": "audio_tower.",
+            "model.audio_tower.norm.": "audio_tower.layer_norm.",
+            "audio_tower.norm.": "audio_tower.layer_norm.",
+            "model.audio_tower.layers.": "audio_tower.layers.",
+        },
+    )
+```
+
+Insert one line before the closing `},`:
+
+```python
+            "lm_head.": "language_model.lm_head.",
+```
+
+- [ ] **Step 8: Smoke check — thinker still constructible**
 
 Run:
 ```bash
@@ -454,7 +503,7 @@ print('_omni_mode default:', 'yes' if hasattr(AeroRealtimeForConditionalGenerati
 
 Expected: `class ok: AeroRealtimeForConditionalGeneration` and no import error.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 cd /data/v-kaichen/vllm-omni
@@ -554,8 +603,6 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
         super().__init__()
         self.vllm_config = vllm_config
         top_config = vllm_config.model_config.hf_config
-        # top_config may be either AeroRealtimeOmniConfig or AeroRealtimeTalkerConfig,
-        # depending on whether we are hosted by the omni dispatcher or loaded standalone.
         if isinstance(top_config, AeroRealtimeOmniConfig):
             self.config: AeroRealtimeTalkerConfig = top_config.talker_config
         else:
@@ -565,11 +612,7 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
         self.have_multimodal_outputs = True
         self.has_preprocess = True
         self.has_postprocess = True
-        # Runner auto-concatenates these keys across streaming chunks. `embed.prefill`
-        # is provided by the thinker as thinker-side word-embeddings at audio_pad
-        # positions (informational; not consumed by preprocess).
         self.streaming_accumulated_keys: set[tuple[str, str]] = {
-            ("embed", "prefill"),
             ("hidden_states", "output"),
             ("codes", "audio"),
             ("codes", "past_group0"),
@@ -599,10 +642,6 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(talker_config.vocab_size)
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
-        # Text projection: thinker hidden → talker hidden.
-        # Note: fc1 in=thinker_hidden_size (2560), fc1 out=text_hidden_size (2048),
-        #       fc2 in=text_hidden_size (2048), fc2 out=hidden_size (1024).
-        # This matches the checkpoint tensor shapes exactly.
         self.text_projection = AeroRealtimeTalkerResizeMLP(
             input_size=talker_config.thinker_hidden_size,
             intermediate_size=talker_config.text_hidden_size,
@@ -634,6 +673,8 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
         self._cp_vllm_config = cp_vllm_config
 
         # Cache tokens we need often as buffers (avoid CPU→GPU per step).
+        if not talker_config.speaker_id:
+            raise ValueError("talker_config.speaker_id must have at least one entry")
         speaker_id = int(next(iter(talker_config.speaker_id.values())))
         cond_ids = torch.tensor(
             [talker_config.codec_bos_id, talker_config.codec_nothink_id, speaker_id],
@@ -676,8 +717,9 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
 
         Prefill branch (span_len > 1): rebuild the full prompt [cond(3) + body(N_total)]
         every chunk since stage-1 KV is cleared per streaming update.
-        Decode branch (span_len == 1): assemble the per-step input using the previous
-        step's `hidden_states.last` and the last-sampled group0 from postprocess.
+        Decode branch (span_len == 1): use the most recent row of accumulated
+        ``hidden_states.output`` and the most recent sampled group-0 code from
+        ``codes.past_group0`` to build one new body slot.
         """
         # Normalize the additional_information top-level shape.
         additional_information = info_dict.get("additional_information")
@@ -738,7 +780,7 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
             if span_len == total:
                 offset = 0
             else:
-                offset = int(meta.get("num_processed_tokens", 0) or 0)
+                offset = int(meta.get("talker_prefill_offset", 0) or 0)
             offset = max(0, min(offset, total))
             end = min(offset + span_len, total)
             take = prompt_embeds_full[offset:end]
@@ -752,7 +794,7 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
             input_ids_out[:] = int(talker_cfg.codec_pad_id)
 
             info_update: dict[str, Any] = {
-                "meta": {"num_processed_tokens": offset + span_len},
+                "meta": {"talker_prefill_offset": offset + span_len},
                 "codes": {"audio": torch.zeros((span_len, int(talker_cfg.num_code_groups)), dtype=torch.long, device=device)},
             }
             return input_ids_out, take, info_update
@@ -782,14 +824,18 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
         return input_ids_out, body_emb, info_update
 
     def postprocess(self, hidden_states: torch.Tensor, sampled_token_ids: torch.Tensor | None = None, **info_dict: Any) -> dict[str, Any]:
-        """After trunk produces last hidden + group0 is sampled, run the nested code_predictor AR."""
+        """Run the nested 15-step code_predictor AR after group-0 is sampled.
+
+        The ``sampled_token_ids is None`` branch is used during profiling / warmup
+        when no logits are available; end-to-end streaming always passes the
+        sampled group-0 id via the runner's postprocess hook (Task 6 wires this).
+        """
         talker_cfg = self.config
         if hidden_states is None or hidden_states.numel() == 0:
             return {}
 
         last_hidden = hidden_states[-1:, :].detach()  # [1, 1024]
         if sampled_token_ids is None:
-            # No sample yet (e.g. during profiling); fill zeros.
             frame = torch.zeros((1, int(talker_cfg.num_code_groups)), dtype=torch.long, device=hidden_states.device)
             return {
                 "hidden_states": {"last": last_hidden},
@@ -802,18 +848,20 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
         # sampled_token_ids: shape [1] on GPU, dtype long. This is group0 for the last frame.
         group0_id = sampled_token_ids.reshape(-1)[-1:].to(dtype=torch.long, device=hidden_states.device)  # [1]
 
-        # Nested 15-step code_predictor AR.
-        # Seed = [trunk_hidden_last ; codec_embedding(group0)]  (shape [1, 2, 1024])
-        cp = self.code_predictor
-        codec_bos_emb = self.embed_input_ids(group0_id).reshape(1, 1, -1)  # [1, 1, 1024]
-        seed = torch.cat([last_hidden.reshape(1, 1, -1), codec_bos_emb], dim=1)  # [1, 2, 1024]
-
-        residuals = cp.generate_residual(
-            seed_embeds=seed,
-            num_groups=int(talker_cfg.num_code_groups) - 1,
-        )  # returns [1, 15] on GPU
-
-        frame = torch.cat([group0_id.reshape(1, 1), residuals.reshape(1, -1)], dim=1).to(dtype=torch.long)  # [1, 16]
+        # Nested 15-step code_predictor AR via CodePredictorWrapper.forward().
+        # The wrapper returns [B, num_groups] with layer0 at column 0 and residuals at 1..G-1.
+        layer0_embed = self.embed_input_ids(group0_id).reshape(1, 1, -1)  # [1, 1, 1024]
+        past_hidden = last_hidden.reshape(1, 1, -1)                       # [1, 1, 1024]
+        audio_codes = self.code_predictor(
+            layer0_code=group0_id.reshape(1, 1),
+            layer0_embed=layer0_embed,
+            last_talker_hidden=past_hidden,
+            do_sample=True,
+            temperature=0.9,
+            top_k=50,
+            top_p=1.0,
+        )  # [1, num_code_groups]
+        frame = audio_codes.reshape(1, -1).to(dtype=torch.long)  # [1, 16]
 
         return {
             "hidden_states": {"last": last_hidden},
@@ -853,24 +901,21 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
 __all__ = ["AeroRealtimeTalkerForConditionalGeneration", "AeroRealtimeTalkerResizeMLP"]
 ```
 
-- [ ] **Step 2: Verify the code_predictor wrapper has a `generate_residual` method**
+- [ ] **Step 2: Verify the code_predictor wrapper API**
 
-The `CodePredictorWrapper` was reviewed at plan-time to expose sample-per-step and CUDA-graph paths, but the exact public method name may differ. Run:
+`CodePredictorWrapper.forward(layer0_code, layer0_embed, last_talker_hidden, do_sample, temperature, top_k, top_p) -> Tensor[B, num_groups]` is the confirmed public entry point (matches `qwen3_tts_talker.py:1693-1701`). The postprocess in Step 1 calls it as a plain callable (`self.code_predictor(...)`).
+
+Sanity check that the wrapper exposes the expected signature:
 
 ```bash
 python -c "
+import inspect
 from vllm_omni.model_executor.models.common.qwen3_code_predictor import CodePredictorWrapper
-methods = [m for m in dir(CodePredictorWrapper) if not m.startswith('_') and callable(getattr(CodePredictorWrapper, m))]
-print('methods:', methods)
+print(inspect.signature(CodePredictorWrapper.forward))
 "
 ```
 
-Expected: a list of public methods. If `generate_residual` is not among them, replace the postprocess call with the correct method name found here. If uncertain, read `/data/v-kaichen/vllm-omni/vllm_omni/model_executor/models/common/qwen3_code_predictor.py` and find the entry point that:
-- takes trunk hidden + first codec id (or their embeds) as input,
-- runs N nested AR steps,
-- returns residual codes as a tensor.
-
-If the API is not a simple call, add a small wrapper method `_run_code_predictor(seed_embeds, num_groups)` inside `AeroRealtimeTalkerForConditionalGeneration` that manually drives the loop using `self.code_predictor.forward` + a sampler.
+Expected: signature contains `layer0_code`, `layer0_embed`, `last_talker_hidden`.
 
 - [ ] **Step 3: Verify import + instantiation (no checkpoint yet)**
 
@@ -925,8 +970,20 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.models.interfaces import (
+    SupportsMRoPE,
+    SupportsMultiModal,
+    SupportsPP,
+    SupportsRealtime,
+)
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
+from vllm.multimodal import MULTIMODAL_REGISTRY
 
+from vllm_omni.model_executor.models.aero_realtime.aero_realtime import (
+    AeroRealtimeDummyInputsBuilder,
+    AeroRealtimeMultiModalProcessor,
+    AeroRealtimeProcessingInfo,
+)
 from vllm_omni.transformers_utils.configs.aero_realtime_omni import (
     AeroRealtimeOmniConfig,
     AeroRealtimeTalkerConfig,
@@ -935,7 +992,30 @@ from vllm_omni.transformers_utils.configs.aero_realtime_omni import (
 logger = init_logger(__name__)
 
 
-class AeroRealtimeOmniForConditionalGeneration(nn.Module):
+class AeroRealtimeOmniProcessingInfo(AeroRealtimeProcessingInfo):
+    """Processing info for the omni dispatcher.
+
+    Unwraps ``AeroRealtimeOmniConfig`` → ``thinker_config`` (an
+    ``AeroRealtimeConfig``) so all downstream processor logic keeps working
+    unchanged.
+    """
+
+    def get_hf_config(self):
+        return self.ctx.get_hf_config(AeroRealtimeOmniConfig).thinker_config
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    AeroRealtimeMultiModalProcessor,
+    info=AeroRealtimeOmniProcessingInfo,
+    dummy_inputs=AeroRealtimeDummyInputsBuilder,
+)
+class AeroRealtimeOmniForConditionalGeneration(
+    nn.Module,
+    SupportsMultiModal,
+    SupportsPP,
+    SupportsMRoPE,
+    SupportsRealtime,
+):
     """Stage-dispatched wrapper for aero_realtime_omni.
 
     Stages:
@@ -955,6 +1035,14 @@ class AeroRealtimeOmniForConditionalGeneration(nn.Module):
         model_stage = getattr(vllm_config.model_config, "model_stage", None) or "thinker"
         self.model_stage = model_stage
 
+        # Register submodules at stage-specific attribute names so PyTorch's
+        # state_dict layout matches the checkpoint prefixes (thinker.* / talker.*
+        # / code2wav.*). Also alias self.model to the active stage; qwen3_omni.py
+        # uses the same pattern.
+        self.thinker = None
+        self.talker = None
+        self.code2wav = None
+
         if model_stage == "thinker":
             thinker_config = top_config.thinker_config
             thinker_vllm_config = vllm_config.with_hf_config(
@@ -962,41 +1050,43 @@ class AeroRealtimeOmniForConditionalGeneration(nn.Module):
             )
             # Signal to the thinker that it should export hidden states + word embeds.
             setattr(thinker_vllm_config.model_config, "omni_mode", True)
-            self.model = init_vllm_registered_model(
+            self.thinker = init_vllm_registered_model(
                 vllm_config=thinker_vllm_config,
                 prefix=maybe_prefix(prefix, "thinker"),
                 hf_config=thinker_config,
                 architectures=["AeroRealtimeForConditionalGeneration"],
             )
+            self.model = self.thinker
         elif model_stage == "talker":
             talker_config: AeroRealtimeTalkerConfig = top_config.talker_config
             talker_vllm_config = vllm_config.with_hf_config(
                 talker_config, architectures=["AeroRealtimeTalkerForConditionalGeneration"]
             )
-            self.model = init_vllm_registered_model(
+            self.talker = init_vllm_registered_model(
                 vllm_config=talker_vllm_config,
                 prefix=maybe_prefix(prefix, "talker"),
                 hf_config=talker_config,
                 architectures=["AeroRealtimeTalkerForConditionalGeneration"],
             )
+            self.model = self.talker
         elif model_stage == "code2wav":
-            # Reuse Qwen3TTSCode2Wav as-is; speech_tokenizer/ dir is expected to
-            # sit next to the checkpoint (user manually cp'd from Qwen3-TTS base).
-            # The vllm_config.model_config.model path is what Qwen3TTSCode2Wav uses.
+            # Qwen3TTSCode2Wav ignores hf_config and loads its weights from
+            # `<model_path>/speech_tokenizer/`; we pass thinker_config only as
+            # a required-but-unused placeholder.
             code2wav_vllm_config = vllm_config.with_hf_config(
                 top_config.thinker_config,
                 architectures=["Qwen3TTSCode2Wav"],
             )
-            self.model = init_vllm_registered_model(
+            self.code2wav = init_vllm_registered_model(
                 vllm_config=code2wav_vllm_config,
                 prefix=maybe_prefix(prefix, "code2wav"),
                 hf_config=top_config.thinker_config,
                 architectures=["Qwen3TTSCode2Wav"],
             )
+            self.model = self.code2wav
         else:
             raise ValueError(f"Invalid model_stage: {model_stage!r}. Must be thinker | talker | code2wav")
 
-        # Delegate common attributes.
         self.have_multimodal_outputs = getattr(self.model, "have_multimodal_outputs", False)
         self.has_preprocess = getattr(self.model, "has_preprocess", False)
         self.has_postprocess = getattr(self.model, "has_postprocess", False)
@@ -1005,10 +1095,22 @@ class AeroRealtimeOmniForConditionalGeneration(nn.Module):
         if hasattr(self.model, "make_empty_intermediate_tensors"):
             self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
-    # Delegate every vLLM-visible method to self.model.
+    def embed_input_ids(self, input_ids: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids, **kwargs)
 
-    def embed_input_ids(self, input_ids: torch.Tensor, **kw: Any) -> torch.Tensor:
-        return self.model.embed_input_ids(input_ids, **kw)
+    def embed_multimodal(self, **kwargs: Any):
+        if hasattr(self.model, "embed_multimodal"):
+            return self.model.embed_multimodal(**kwargs)
+        raise AttributeError(
+            f"stage={self.model_stage!r} submodule has no embed_multimodal"
+        )
+
+    def get_mrope_input_positions(self, *args: Any, **kwargs: Any):
+        if hasattr(self.model, "get_mrope_input_positions"):
+            return self.model.get_mrope_input_positions(*args, **kwargs)
+        raise AttributeError(
+            f"stage={self.model_stage!r} submodule has no get_mrope_input_positions"
+        )
 
     def forward(self, *args, **kwargs):
         return self.model.forward(*args, **kwargs)
@@ -1017,9 +1119,7 @@ class AeroRealtimeOmniForConditionalGeneration(nn.Module):
         return self.model.compute_logits(*args, **kwargs)
 
     def make_omni_output(self, *args, **kwargs):
-        if hasattr(self.model, "make_omni_output"):
-            return self.model.make_omni_output(*args, **kwargs)
-        raise AttributeError("submodule has no make_omni_output")
+        return self.model.make_omni_output(*args, **kwargs)
 
     def preprocess(self, *args, **kwargs):
         return self.model.preprocess(*args, **kwargs)
@@ -1028,32 +1128,33 @@ class AeroRealtimeOmniForConditionalGeneration(nn.Module):
         return self.model.postprocess(*args, **kwargs)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Filter to the prefix owned by this stage before delegating.
-        if self.model_stage == "thinker":
-            keep_prefix = "thinker."
-            strip = True
-        elif self.model_stage == "talker":
-            keep_prefix = "talker."
-            strip = False  # AeroRealtimeTalker's hf_to_vllm_mapper expects the "talker." prefix.
-        else:  # code2wav — weights come from a separate speech_tokenizer/ checkpoint at load time.
-            keep_prefix = None
-            strip = False
+        """Route checkpoint weights to the appropriate submodule by top-level prefix.
 
-        if keep_prefix is None:
-            return self.model.load_weights(weights)
+        - thinker.* → strip the prefix (thinker's hf_to_vllm_mapper uses unprefixed keys)
+        - talker.*  → keep the prefix (talker's hf_to_vllm_mapper has "talker.*" rules)
+        - code2wav.* → keep the prefix; Qwen3TTSCode2Wav loads separately anyway
+        """
+        loaded: set[str] = set()
+        thinker_weights: list[tuple[str, torch.Tensor]] = []
+        talker_weights: list[tuple[str, torch.Tensor]] = []
+        code2wav_weights: list[tuple[str, torch.Tensor]] = []
 
-        def _filter():
-            for name, w in weights:
-                if not name.startswith(keep_prefix):
-                    continue
-                if strip:
-                    yield name[len(keep_prefix) :], w
-                else:
-                    yield name, w
+        for name, w in weights:
+            if name.startswith("thinker."):
+                thinker_weights.append((name[len("thinker."):], w))
+            elif name.startswith("talker."):
+                talker_weights.append((name, w))
+            elif name.startswith("code2wav."):
+                code2wav_weights.append((name, w))
 
-        return self.model.load_weights(_filter())
+        if self.thinker is not None and thinker_weights:
+            loaded |= {f"thinker.{n}" for n in self.thinker.load_weights(thinker_weights)}
+        if self.talker is not None and talker_weights:
+            loaded |= {f"talker.{n}" for n in self.talker.load_weights(talker_weights)}
+        if self.code2wav is not None and code2wav_weights:
+            loaded |= {f"code2wav.{n}" for n in self.code2wav.load_weights(code2wav_weights)}
+        return loaded
 
-    # For SupportsRealtime protocol used by the current aero pipeline; delegate.
     @classmethod
     async def buffer_realtime_omni(cls, *args, **kwargs):
         from vllm_omni.model_executor.models.aero_realtime.aero_realtime import (
@@ -1214,7 +1315,11 @@ from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
 
 
-# ---- helpers ----------------------------------------------------------------
+# The thinker config carries audio_token_index=151671 (aero_realtime.py). Since
+# the request object doesn't expose the hf_config in current vLLM-Omni, we
+# hardcode the aero-realtime <|audio_pad|> id at module scope, matching how
+# qwen3_omni.py:32-35 hardcodes im_start / user / assistant token ids.
+_AUDIO_PAD_TOKEN_ID = 151671
 
 
 def _ensure_list(x):
@@ -1225,12 +1330,19 @@ def _ensure_list(x):
     return list(x)
 
 
-def _audio_token_id_from_request(request: OmniEngineCoreRequest) -> int:
-    # The thinker config carries audio_token_index=151671.
-    hf_config = request.stage_hf_config
-    return int(
-        getattr(hf_config, "audio_token_index", None)
-        or getattr(hf_config, "audio_token_id", 151671)
+def _codec_chunk_config(transfer_manager: Any) -> tuple[int, int]:
+    """Read (codec_chunk_frames, codec_left_context_frames) from the connector config.
+
+    Matches the pattern in qwen3_omni.py:515-519, fish_speech.py:81-85, cosyvoice3.py.
+    """
+    extra = {}
+    connector = getattr(transfer_manager, "connector", None)
+    if connector is not None:
+        cfg = getattr(connector, "config", None) or {}
+        extra = cfg.get("extra", {}) or {}
+    return (
+        int(extra.get("codec_chunk_frames", 25)),
+        int(extra.get("codec_left_context_frames", 25)),
     )
 
 
@@ -1243,10 +1355,12 @@ def _filter_audio_pad_rows(
     """Filter [T, H] hidden and embed to only the rows at audio_pad positions in this step."""
     if hidden is None or hidden.numel() == 0 or not step_input_ids:
         return hidden, embed
+    if hidden.shape[0] != len(step_input_ids):
+        # Defensive: shape mismatch → skip the filter rather than IndexError.
+        return hidden, embed
     ids = torch.tensor(step_input_ids, dtype=torch.long, device=hidden.device)
     mask = ids == audio_token_id
     if int(mask.sum().item()) == 0:
-        # No new audio_pad slot in this step — return empty [0, H].
         return hidden.new_zeros((0, hidden.shape[-1])), embed.new_zeros((0, embed.shape[-1]))
     return hidden[mask], embed[mask]
 
@@ -1260,31 +1374,27 @@ def thinker2talker_async_chunk(
     request: OmniEngineCoreRequest,
     is_finished: bool = False,
 ) -> dict[str, Any] | None:
-    """Per-step producer hook: extract new audio_pad hidden states from the thinker."""
+    """Per-step producer hook: extract new audio_pad hidden states from the thinker.
+
+    `pooling_output` is already the flat multimodal-outputs dict (not wrapped
+    under a `multimodal_outputs` key) — matches how qwen3_omni.py:303-305 reads it.
+    """
     if not isinstance(pooling_output, dict):
         return None
 
-    mm = pooling_output.get("multimodal_outputs") or pooling_output
-    hs = (mm.get("hidden_states") or {}).get("output")
-    embed = (mm.get("embed") or {}).get("prefill")
+    hs = (pooling_output.get("hidden_states") or {}).get("output")
+    embed = (pooling_output.get("embed") or {}).get("prefill")
     if not isinstance(hs, torch.Tensor) or not isinstance(embed, torch.Tensor):
-        # Thinker didn't emit hidden states this step (unexpected in omni mode).
         return None
 
-    # The thinker exposes hidden/embed for THIS step's tokens (i.e. the newly appended
-    # tokens in stage-0 append-only mode). Filter to audio_pad positions.
-    audio_token_id = _audio_token_id_from_request(request)
-    step_input_ids: list[int] = list(getattr(request, "last_step_input_ids", []) or [])
-    if not step_input_ids:
-        # Fallback: derive from most-recent prompt tail using request.all_token_ids.
-        all_ids = _ensure_list(request.all_token_ids)
-        # This step processed the last N tokens, where N == hs.shape[0].
-        n = int(hs.shape[0])
-        step_input_ids = all_ids[-n:] if n > 0 else []
+    # Derive per-step token ids from the tail of request.all_token_ids
+    # (request has no `last_step_input_ids` attribute in current vLLM-Omni).
+    all_ids = _ensure_list(request.all_token_ids)
+    n = int(hs.shape[0])
+    step_input_ids = all_ids[-n:] if n > 0 else []
 
-    hs_filtered, emb_filtered = _filter_audio_pad_rows(hs, embed, step_input_ids, audio_token_id)
+    hs_filtered, emb_filtered = _filter_audio_pad_rows(hs, embed, step_input_ids, _AUDIO_PAD_TOKEN_ID)
     if hs_filtered.shape[0] == 0 and not is_finished:
-        # No new audio_pad rows this step; skip send.
         return None
 
     payload: OmniPayload = {
@@ -1306,8 +1416,7 @@ def thinker2talker(
     the completed thinker stage output. Used when async_chunk=False.
 
     For a realtime streaming pipeline this path is mostly a safety net; the primary
-    path is the async_chunk hook above. We produce one prompt whose placeholder
-    length equals 3 (cond triplet) + N_total_audio_pad_frames.
+    path is the async_chunk hook above.
     """
     stage_id = engine_input_source[0]
     thinker_outputs = stage_list[stage_id].engine_outputs
@@ -1320,13 +1429,11 @@ def thinker2talker(
         hs = (mm.get("hidden_states") or {}).get("output")
         embed = (mm.get("embed") or {}).get("prefill")
         all_ids = _ensure_list(out.prompt_token_ids) + _ensure_list(top.cumulative_token_ids)
-        audio_token_id = 151671  # aero default; the caller can override via stage config if needed.
 
-        # Filter to audio_pad rows over the full history.
         if isinstance(hs, torch.Tensor) and isinstance(embed, torch.Tensor) and all_ids:
             n = int(hs.shape[0])
             ids_tail = all_ids[-n:]
-            hs, embed = _filter_audio_pad_rows(hs.to(device), embed.to(device), ids_tail, audio_token_id)
+            hs, embed = _filter_audio_pad_rows(hs.to(device), embed.to(device), ids_tail, _AUDIO_PAD_TOKEN_ID)
 
         payload: OmniPayload = {
             "embed": {"prefill": embed.detach().to("cpu") if isinstance(embed, torch.Tensor) else torch.empty(0)},
@@ -1361,8 +1468,7 @@ def talker2code2wav_async_chunk(
     """
     if not isinstance(pooling_output, dict):
         return None
-    mm = pooling_output.get("multimodal_outputs") or pooling_output
-    codes = (mm.get("codes") or {}).get("audio")
+    codes = (pooling_output.get("codes") or {}).get("audio")
     if not isinstance(codes, torch.Tensor) or codes.numel() == 0:
         return None
 
@@ -1372,11 +1478,9 @@ def talker2code2wav_async_chunk(
     frame_buf.append(codes.detach().to(device="cpu", dtype=torch.long).reshape(-1))
 
     finished = bool(is_finished or request.is_finished())
-    chunk_frames = int(getattr(transfer_manager, "codec_chunk_frames", 25) or 25)
-    left_context = int(getattr(transfer_manager, "codec_left_context_frames", 25) or 25)
+    chunk_frames, left_context = _codec_chunk_config(transfer_manager)
 
     total = len(frame_buf)
-    # Emit only on chunk boundary or finish.
     already_sent = int(transfer_manager.put_req_chunk[request_id]) * chunk_frames
     pending = total - already_sent
     if pending == 0:
@@ -1529,27 +1633,37 @@ __all__ = ["AERO_REALTIME_PIPELINE", "AERO_REALTIME_OMNI_PIPELINE"]
 
 Also update the existing `__all__ = ["AERO_REALTIME_PIPELINE"]` line — replace it as shown above.
 
-- [ ] **Step 2: Register the new pipeline in the pipeline registry**
+- [ ] **Step 2: Register the new pipeline in `pipeline_registry.py`**
 
-Grep to find where existing pipelines are registered:
-```bash
-rg -n 'AERO_REALTIME_PIPELINE|register_pipeline|PIPELINES\s*=' /data/v-kaichen/vllm-omni/vllm_omni/config/ 2>&1 | head
+Pipeline registration is NOT automatic in vllm-omni. `vllm_omni/config/pipeline_registry.py`
+holds an explicit `_OMNI_PIPELINES: dict[str, tuple[str, str]]` map keyed by `model_type`;
+every existing pipeline (qwen3_omni_moe, aero_realtime, etc.) has an entry there. Add:
+
+```python
+"aero_realtime_omni": (
+    "vllm_omni.model_executor.models.aero_realtime.pipeline",
+    "AERO_REALTIME_OMNI_PIPELINE",
+),
 ```
 
-Then, following the pattern used by other pipelines (e.g. `QWEN3_OMNI_PIPELINE`), register `AERO_REALTIME_OMNI_PIPELINE` in the same registry. If the pattern uses a decorator or an explicit `PIPELINES.append(...)`, mimic the existing entry for `AERO_REALTIME_PIPELINE`.
-
-If the registration is fully automatic via `hf_architectures`, no further action is needed — the model registry alone is enough. Verify by running Step 4 below.
+Insert it alongside the existing `"aero_realtime"` entry so the two variants sit together.
 
 - [ ] **Step 3: Create the deploy yaml**
 
-Write `/data/v-kaichen/vllm-omni/vllm_omni/deploy/aero_realtime_omni.yaml`:
+Write `/data/v-kaichen/vllm-omni/vllm_omni/deploy/aero_realtime_omni.yaml`. This default
+layout splits the 3 stages across 2 GPUs (stage 0 on cuda:0, stages 1+2 on cuda:1); on
+single-GPU hosts, override `devices:` and `gpu_memory_utilization:` per stage via a
+per-machine yaml or CLI. `max_model_len` is intentionally NOT pinned here — the model's
+config-declared context (262144 for Qwen3-VL) applies unless the caller overrides it at
+`AsyncOmni(max_model_len=...)`.
 
 ```yaml
 # aero_realtime_omni: 3-stage streaming pipeline
 # Stage 0 = thinker (Qwen3-VL 4B), stages 1/2 = talker (0.6B) + code2wav (~few MB)
 #
-# For single-GPU dev: put all stages on cuda:0 with tight memory budgets.
-# For 2-GPU: put stage 0 on cuda:0, stages 1+2 on cuda:1.
+# Default layout (multi-GPU): stage 0 on cuda:0, stage 1 on cuda:1, stage 2 on cuda:1.
+# For single-GPU deployments override devices + gpu_memory_utilization via CLI or a
+# per-machine yaml.
 async_chunk: true
 dtype: bfloat16
 
@@ -1563,7 +1677,7 @@ connectors:
 stages:
   - stage_id: 0
     max_num_seqs: 1
-    gpu_memory_utilization: 0.6
+    gpu_memory_utilization: 0.8
     enforce_eager: true
     mm_processor_cache_gb: 0
     devices: "0"
@@ -1576,9 +1690,9 @@ stages:
 
   - stage_id: 1
     max_num_seqs: 1
-    gpu_memory_utilization: 0.2
+    gpu_memory_utilization: 0.6
     enforce_eager: true
-    devices: "0"
+    devices: "1"
     input_connectors:
       from_stage_0: connector_of_shared_memory
     default_sampling_params:
@@ -1589,11 +1703,11 @@ stages:
 
   - stage_id: 2
     max_num_seqs: 1
-    gpu_memory_utilization: 0.05
+    gpu_memory_utilization: 0.15
     enforce_eager: true
     async_scheduling: false
     max_num_batched_tokens: 51200
-    devices: "0"
+    devices: "1"
     input_connectors:
       from_stage_1: connector_of_shared_memory
     default_sampling_params:
@@ -1626,6 +1740,7 @@ stages: [(0, 'thinker'), (1, 'talker'), (2, 'code2wav')]
 ```bash
 cd /data/v-kaichen/vllm-omni
 git add vllm_omni/model_executor/models/aero_realtime/pipeline.py \
+        vllm_omni/config/pipeline_registry.py \
         vllm_omni/deploy/aero_realtime_omni.yaml
 git commit -s -m "feat(aero_realtime_omni): 3-stage pipeline + deploy config"
 ```
@@ -1671,35 +1786,63 @@ model_type: aero_realtime_omni
 talker.num_hidden_layers: 28
 ```
 
-- [ ] **Step 3: Try instantiating `AsyncOmni` with the deploy config (dry-run: skip mm profiling)**
+- [ ] **Step 3: Try instantiating `AsyncOmni` with the deploy config (real weight load)**
 
-This will attempt to load ALL 3 stages with real weights, so it exercises `load_weights` for thinker, talker, and code2wav. On single-GPU systems this may OOM; skip if so.
+This will attempt to load ALL 3 stages with real weights, so it exercises `load_weights`
+for thinker, talker, and code2wav.
+
+**Important**: write the smoke test to a real file (not a `python - <<'PY'` heredoc).
+vllm-omni's stage init unconditionally sets `VLLM_WORKER_MULTIPROC_METHOD=spawn`, and
+the spawn child re-imports the caller's file. A heredoc'd script becomes `<stdin>` on
+disk and the child fails with `FileNotFoundError`. Use the pattern below:
 
 ```bash
-python - <<'PY'
+cat > /tmp/smoke_task8.py <<'PY'
 import asyncio
+import warnings
+warnings.filterwarnings("ignore")
+
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 
 async def main():
-    omni = AsyncOmni(
-        model="/data/v-kaichen/azure_blob/output/aero_realtime_omni_qwen3vl_4b_qwen3tts_0_6b_1x4_a100_80g_lr1e_4_cosine",
-        deploy_config="vllm_omni/deploy/aero_realtime_omni.yaml",
-        log_stats=False,
-        gpu_memory_utilization=0.9,
-        skip_mm_profiling=True,
-    )
-    print("OK — all 3 stages loaded")
+    try:
+        omni = AsyncOmni(
+            model="/data/v-kaichen/azure_blob/output/aero_realtime_omni_qwen3vl_4b_qwen3tts_0_6b_1x4_a100_80g_lr1e_4_cosine",
+            deploy_config="vllm_omni/deploy/aero_realtime_omni.yaml",
+            log_stats=False,
+            gpu_memory_utilization=0.9,
+            skip_mm_profiling=True,
+        )
+        print("OK — all 3 stages loaded")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise
     await asyncio.sleep(0)
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
 PY
+
+cd /data/v-kaichen/vllm-omni
+python /tmp/smoke_task8.py
 ```
 
-Expected: `OK — all 3 stages loaded` and no exception. If a specific stage fails, the traceback will identify which prefix in `hf_to_vllm_mapper` did not resolve.
+Expected: `OK — all 3 stages loaded` and no exception.
+
+Notes:
+- Requires ≥2 GPUs by default (see Task 7 deploy yaml). For single-GPU dev, override
+  `devices` and `gpu_memory_utilization` in a per-machine yaml.
+- `AsyncOmni` does not accept an `only_stage` kwarg; there's no built-in way to load
+  only a subset of stages. If a stage fails, isolate the traceback by inspecting logs.
 
 Debug tips if this fails:
-- Missing tensors: check the corresponding stage's `hf_to_vllm_mapper` prefixes against the actual checkpoint keys via `python -c "from safetensors import safe_open; ..."`
-- Unexpected tensor shape: check that the stage sub-config values (num_hidden_layers, hidden_size, etc.) match `config.json`
+- Missing tensors: check the corresponding stage's `hf_to_vllm_mapper` prefixes against
+  the actual checkpoint keys via `python -c "from safetensors import safe_open; ..."`
+- Unexpected tensor shape: check that the stage sub-config values (num_hidden_layers,
+  hidden_size, etc.) match `config.json`.
+- KV cache OOM: reduce `max_model_len` at the `AsyncOmni(...)` call site (do NOT pin
+  it in the yaml — that's host-specific tuning).
 
 - [ ] **Step 4: (No commit) — this is a validation-only task**
 
@@ -1958,7 +2101,7 @@ If audio is silent or garbled, the most likely culprits (in order):
 2. `codec_head` weight mismatch (verify `weight` shape is `[3072, 1024]`).
 3. Wrong `codec_bos_id` / `codec_nothink_id` / `speaker_id=3061` values in `AeroRealtimeTalkerConfig`.
 4. Group-0 sampling stop condition (verify `stop_token_ids=[2150]` = codec_eos_id in pipeline).
-5. `code_predictor.generate_residual` (or whatever the equivalent method resolved to in Task 3 Step 2) returning wrong-shaped residuals.
+5. `code_predictor(...)` (CodePredictorWrapper.forward) returning wrong-shaped codes.
 
 - [ ] **Step 7: Commit**
 
