@@ -39,6 +39,7 @@ class AeroRealtimeTalkerCodePredictorConfig(PretrainedConfig):
         initializer_range: float = 0.02,
         use_cache: bool = True,
         pad_token_id: int = 0,
+        tie_word_embeddings: bool = False,
         layer_types: list | None = None,
         **kwargs,
     ):
@@ -64,7 +65,7 @@ class AeroRealtimeTalkerCodePredictorConfig(PretrainedConfig):
         self.initializer_range = initializer_range
         self.use_cache = use_cache
         self.layer_types = layer_types if layer_types is not None else ["full_attention"] * num_hidden_layers
-        super().__init__(pad_token_id=pad_token_id, **kwargs)
+        super().__init__(pad_token_id=pad_token_id, tie_word_embeddings=tie_word_embeddings, **kwargs)
 
 
 class AeroRealtimeTalkerConfig(PretrainedConfig):
@@ -101,6 +102,7 @@ class AeroRealtimeTalkerConfig(PretrainedConfig):
         initializer_range: float = 0.02,
         use_cache: bool = True,
         pad_token_id: int = 0,
+        tie_word_embeddings: bool = False,
         code_predictor_config=None,
         **kwargs,
     ):
@@ -146,7 +148,7 @@ class AeroRealtimeTalkerConfig(PretrainedConfig):
         self.speaker_id = speaker_id if speaker_id is not None else {"ryan": 3061}
         self.initializer_range = initializer_range
         self.use_cache = use_cache
-        super().__init__(pad_token_id=pad_token_id, **kwargs)
+        super().__init__(pad_token_id=pad_token_id, tie_word_embeddings=tie_word_embeddings, **kwargs)
 
 
 class AeroRealtimeOmniConfig(PretrainedConfig):
