@@ -1,0 +1,57 @@
+# aero_realtime_omni: 3-stage streaming pipeline
+# Stage 0 = thinker (Qwen3-VL 4B), stages 1/2 = talker (0.6B) + code2wav (~few MB)
+#
+# For single-GPU dev: put all stages on cuda:0 with tight memory budgets.
+# For 2-GPU: put stage 0 on cuda:0, stages 1+2 on cuda:1.
+async_chunk: true
+dtype: bfloat16
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      codec_chunk_frames: 25
+      codec_left_context_frames: 25
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.6
+    enforce_eager: true
+    mm_processor_cache_gb: 0
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1
+      seed: 42
+
+  - stage_id: 1
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.2
+    enforce_eager: true
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      seed: 42
+
+  - stage_id: 2
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.05
+    enforce_eager: true
+    async_scheduling: false
+    max_num_batched_tokens: 51200
+    devices: "0"
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42

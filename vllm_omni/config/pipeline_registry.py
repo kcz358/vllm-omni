@@ -93,4 +93,8 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.aero_realtime.pipeline",
         "AERO_REALTIME_PIPELINE",
     ),
+    "aero_realtime_omni": (
+        "vllm_omni.model_executor.models.aero_realtime.pipeline",
+        "AERO_REALTIME_OMNI_PIPELINE",
+    ),
 }
