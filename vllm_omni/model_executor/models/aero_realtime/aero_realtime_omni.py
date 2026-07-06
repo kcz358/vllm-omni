@@ -21,7 +21,13 @@ from vllm.model_executor.models.interfaces import (
     SupportsRealtime,
 )
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
+from vllm.multimodal import MULTIMODAL_REGISTRY
 
+from vllm_omni.model_executor.models.aero_realtime.aero_realtime import (
+    AeroRealtimeDummyInputsBuilder,
+    AeroRealtimeMultiModalProcessor,
+    AeroRealtimeProcessingInfo,
+)
 from vllm_omni.transformers_utils.configs.aero_realtime_omni import (
     AeroRealtimeOmniConfig,
     AeroRealtimeTalkerConfig,
@@ -30,6 +36,11 @@ from vllm_omni.transformers_utils.configs.aero_realtime_omni import (
 logger = init_logger(__name__)
 
 
+@MULTIMODAL_REGISTRY.register_processor(
+    AeroRealtimeMultiModalProcessor,
+    info=AeroRealtimeProcessingInfo,
+    dummy_inputs=AeroRealtimeDummyInputsBuilder,
+)
 class AeroRealtimeOmniForConditionalGeneration(
     nn.Module,
     SupportsMultiModal,
