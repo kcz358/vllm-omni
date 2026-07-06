@@ -145,11 +145,33 @@ class AeroRealtimeOmniForConditionalGeneration(
         # code2wav stages inherit `SupportsMultiModal` at the class level (needed
         # for the shared @MULTIMODAL_REGISTRY.register_processor decorator to
         # attach a `_processor_factory` for the thinker path), but they never
-        # process mm inputs. Return an empty list so `profile_run` treats these
-        # stages as embedding-only.
+        # process mm inputs. `profile_run` still invokes `embed_multimodal` on
+        # these stages, so we need to return one zero tensor per dummy input
+        # item to satisfy `sanity_check_mm_encoder_outputs`.
         if hasattr(self.model, "embed_multimodal"):
             return self.model.embed_multimodal(**kwargs)
-        return []
+        # Code2Wav has no embed_multimodal; synthesize dummy per-item zeros
+        # matching the thinker text hidden size so profile assertions pass.
+        thinker_hidden = int(self.config.thinker_config.text_config.hidden_size)
+        device = next(self.parameters()).device
+        dummy: list[torch.Tensor] = []
+
+        def _n_tokens(item_shape: torch.Tensor) -> int:
+            return max(1, int(torch.as_tensor(item_shape).prod().item()))
+
+        for grid_key in ("image_grid_thw", "video_grid_thw"):
+            grid = kwargs.get(grid_key)
+            if isinstance(grid, torch.Tensor) and grid.numel() > 0:
+                grid_2d = grid if grid.ndim == 2 else grid.reshape(-1, grid.shape[-1])
+                for row in grid_2d:
+                    dummy.append(torch.zeros(_n_tokens(row), thinker_hidden, device=device, dtype=torch.bfloat16))
+
+        input_features = kwargs.get("input_features")
+        if isinstance(input_features, torch.Tensor) and input_features.numel() > 0:
+            n_audio = input_features.shape[0] if input_features.ndim >= 3 else 1
+            for _ in range(int(n_audio)):
+                dummy.append(torch.zeros(1, thinker_hidden, device=device, dtype=torch.bfloat16))
+        return tuple(dummy)
 
     def get_mrope_input_positions(self, *args: Any, **kwargs: Any):
         # M-RoPE positions only apply to the thinker (vision + audio + text).
