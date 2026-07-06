@@ -254,7 +254,7 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
             if span_len == total:
                 offset = 0
             else:
-                offset = int(meta.get("num_processed_tokens", 0) or 0)
+                offset = int(meta.get("talker_prefill_offset", 0) or 0)
             offset = max(0, min(offset, total))
             end = min(offset + span_len, total)
             take = prompt_embeds_full[offset:end]
@@ -267,7 +267,7 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
             input_ids_out[:] = int(talker_cfg.codec_pad_id)
 
             info_update: dict[str, Any] = {
-                "meta": {"num_processed_tokens": offset + span_len},
+                "meta": {"talker_prefill_offset": offset + span_len},
                 "codes": {
                     "audio": torch.zeros(
                         (span_len, int(talker_cfg.num_code_groups)),
