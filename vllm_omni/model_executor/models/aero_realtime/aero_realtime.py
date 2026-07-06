@@ -24,6 +24,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.inputs import MultiModalDataDict, PromptType, TokensPrompt
 
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
@@ -517,6 +518,14 @@ class AeroRealtimeForConditionalGeneration(
 
         self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
         self.has_preprocess = True
+        self._omni_mode: bool = bool(getattr(vllm_config.model_config, "omni_mode", False))
+        if self._omni_mode:
+            self.have_multimodal_outputs = True
+            self.has_postprocess = True
+            # For thinker-as-stage-0 in the 3-stage pipeline, additional_information payloads
+            # do NOT need cross-chunk accumulation on the producer side; the scheduler emits
+            # per-step deltas that the talker (stage 1) will accumulate.
+            self.streaming_accumulated_keys: set[tuple[str, str]] = set()
 
     @staticmethod
     def build_audio_realtime_text_stream_ids(
@@ -1110,12 +1119,57 @@ class AeroRealtimeForConditionalGeneration(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple:
         if intermediate_tensors is not None:
             inputs_embeds = None
-        return self.language_model.model(input_ids, positions, intermediate_tensors, inputs_embeds=inputs_embeds)
+        hidden = self.language_model.model(
+            input_ids, positions, intermediate_tensors, inputs_embeds=inputs_embeds
+        )
+        if not self._omni_mode:
+            return hidden
+        if isinstance(hidden, IntermediateTensors):
+            return hidden
+        # In omni mode, also emit the word embedding at each token position so the
+        # downstream talker can key its stream on audio_pad slots without re-embedding.
+        if inputs_embeds is not None:
+            embed_prefill = inputs_embeds
+        elif input_ids is not None:
+            embed_prefill = self.language_model.embed_input_ids(input_ids)
+        else:
+            embed_prefill = hidden.new_zeros((0, hidden.shape[-1]))
+        captured: dict = {
+            "hidden_states": {"output": hidden},
+            "embed": {"prefill": embed_prefill},
+        }
+        return hidden, captured
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+    def make_omni_output(self, model_outputs, **kwargs):
+        if isinstance(model_outputs, OmniOutput):
+            return model_outputs
+        if isinstance(model_outputs, tuple) and len(model_outputs) == 2:
+            hidden, captured = model_outputs
+            return OmniOutput(
+                text_hidden_states=hidden.reshape(-1, hidden.shape[-1]),
+                multimodal_outputs=captured,
+            )
+        if not isinstance(model_outputs, torch.Tensor):
+            raise TypeError(
+                f"AeroRealtime.make_omni_output expected torch.Tensor, OmniOutput, "
+                f"or 2-tuple; got {type(model_outputs).__name__}"
+            )
+        return OmniOutput(
+            text_hidden_states=model_outputs.reshape(-1, model_outputs.shape[-1]),
+            multimodal_outputs=None,
+        )
+
+    def postprocess(self, hidden_states: torch.Tensor, **_: Any) -> dict[str, Any]:
+        # Thinker stage 0 has no cross-step state to save on the producer side; the
+        # talker stage (1) does its own state management from the accumulated payload.
+        return {}
+
+    def compute_logits(self, hidden_states: torch.Tensor | OmniOutput) -> torch.Tensor | None:
+        if isinstance(hidden_states, OmniOutput):
+            hidden_states = hidden_states.text_hidden_states
         return self.language_model.compute_logits(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
