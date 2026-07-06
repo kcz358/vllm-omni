@@ -79,6 +79,10 @@ class AeroRealtimeOmniForConditionalGeneration(
         model_stage = getattr(vllm_config.model_config, "model_stage", None) or "thinker"
         self.model_stage = model_stage
 
+        self.thinker = None
+        self.talker = None
+        self.code2wav = None
+
         if model_stage == "thinker":
             thinker_config = top_config.thinker_config
             thinker_vllm_config = vllm_config.with_hf_config(
@@ -86,23 +90,25 @@ class AeroRealtimeOmniForConditionalGeneration(
             )
             # Signal to the thinker that it should export hidden states + word embeds.
             setattr(thinker_vllm_config.model_config, "omni_mode", True)
-            self.model = init_vllm_registered_model(
+            self.thinker = init_vllm_registered_model(
                 vllm_config=thinker_vllm_config,
                 prefix=maybe_prefix(prefix, "thinker"),
                 hf_config=thinker_config,
                 architectures=["AeroRealtimeForConditionalGeneration"],
             )
+            self.model = self.thinker
         elif model_stage == "talker":
             talker_config: AeroRealtimeTalkerConfig = top_config.talker_config
             talker_vllm_config = vllm_config.with_hf_config(
                 talker_config, architectures=["AeroRealtimeTalkerForConditionalGeneration"]
             )
-            self.model = init_vllm_registered_model(
+            self.talker = init_vllm_registered_model(
                 vllm_config=talker_vllm_config,
                 prefix=maybe_prefix(prefix, "talker"),
                 hf_config=talker_config,
                 architectures=["AeroRealtimeTalkerForConditionalGeneration"],
             )
+            self.model = self.talker
         elif model_stage == "code2wav":
             # Qwen3TTSCode2Wav ignores hf_config and loads its weights from
             # `<model_path>/speech_tokenizer/`; we pass thinker_config only as
@@ -113,12 +119,13 @@ class AeroRealtimeOmniForConditionalGeneration(
                 top_config.thinker_config,
                 architectures=["Qwen3TTSCode2Wav"],
             )
-            self.model = init_vllm_registered_model(
+            self.code2wav = init_vllm_registered_model(
                 vllm_config=code2wav_vllm_config,
                 prefix=maybe_prefix(prefix, "code2wav"),
                 hf_config=top_config.thinker_config,
                 architectures=["Qwen3TTSCode2Wav"],
             )
+            self.model = self.code2wav
         else:
             raise ValueError(f"Invalid model_stage: {model_stage!r}. Must be thinker | talker | code2wav")
 
@@ -163,30 +170,48 @@ class AeroRealtimeOmniForConditionalGeneration(
         return self.model.postprocess(*args, **kwargs)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Filter to the prefix owned by this stage before delegating.
-        if self.model_stage == "thinker":
-            keep_prefix = "thinker."
-            strip = True
-        elif self.model_stage == "talker":
-            keep_prefix = "talker."
-            strip = False  # AeroRealtimeTalker's hf_to_vllm_mapper expects the "talker." prefix.
-        else:  # code2wav — weights come from a separate speech_tokenizer/ checkpoint at load time.
-            keep_prefix = None
-            strip = False
+        """Route checkpoint weights to the appropriate submodule based on top-level prefix.
 
-        if keep_prefix is None:
-            return self.model.load_weights(weights)
+        The submodules are registered under their stage-specific attribute names
+        (``self.thinker`` / ``self.talker`` / ``self.code2wav``), so PyTorch's
+        state_dict layout naturally matches the checkpoint's ``thinker.*`` /
+        ``talker.*`` / ``code2wav.*`` prefixes. Each submodule's own
+        ``hf_to_vllm_mapper`` handles further name rewrites.
 
-        def _filter():
-            for name, w in weights:
-                if not name.startswith(keep_prefix):
-                    continue
-                if strip:
-                    yield name[len(keep_prefix) :], w
-                else:
-                    yield name, w
+        The thinker's mapper uses unprefixed keys (e.g. ``language_model.``),
+        so we strip ``thinker.`` before delegating. The talker's mapper keys
+        include the ``talker.`` prefix, so we keep it. code2wav loads from a
+        separate ``speech_tokenizer/`` checkpoint and is passed through.
+        """
+        loaded: set[str] = set()
+        thinker_weights: list[tuple[str, torch.Tensor]] = []
+        talker_weights: list[tuple[str, torch.Tensor]] = []
+        code2wav_weights: list[tuple[str, torch.Tensor]] = []
 
-        return self.model.load_weights(_filter())
+        for name, w in weights:
+            if name.startswith("thinker."):
+                thinker_weights.append((name[len("thinker.") :], w))
+            elif name.startswith("talker."):
+                talker_weights.append((name, w))
+            elif name.startswith("code2wav."):
+                code2wav_weights.append((name, w))
+            else:
+                # Unknown prefix — skip silently for forward compat.
+                pass
+
+        if self.thinker is not None and thinker_weights:
+            loaded_names = self.thinker.load_weights(thinker_weights)
+            loaded |= {f"thinker.{n}" for n in loaded_names}
+
+        if self.talker is not None and talker_weights:
+            loaded_names = self.talker.load_weights(talker_weights)
+            loaded |= {f"talker.{n}" for n in loaded_names}
+
+        if self.code2wav is not None and code2wav_weights:
+            loaded_names = self.code2wav.load_weights(code2wav_weights)
+            loaded |= {f"code2wav.{n}" for n in loaded_names}
+
+        return loaded
 
     @classmethod
     async def buffer_realtime_omni(cls, *args, **kwargs):
