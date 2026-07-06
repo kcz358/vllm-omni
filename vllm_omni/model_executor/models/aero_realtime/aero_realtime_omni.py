@@ -187,6 +187,8 @@ class AeroRealtimeOmniForConditionalGeneration(
         # gets a valid (positions, delta) tuple (matches qwen3_omni).
         if hasattr(self.model, "get_mrope_input_positions"):
             return self.model.get_mrope_input_positions(*args, **kwargs)
+        # Drop kwargs that the base rope helper does not accept.
+        kwargs.pop("mm_features", None)
         return MRotaryEmbedding.get_input_positions_tensor(*args, **kwargs)
 
     def forward(self, *args, **kwargs):
