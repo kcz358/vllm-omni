@@ -134,6 +134,12 @@ class AeroRealtimeOmniForConditionalGeneration(
         self.has_postprocess = getattr(self.model, "has_postprocess", False)
         self.streaming_accumulated_keys = getattr(self.model, "streaming_accumulated_keys", set())
         self.gpu_resident_buffer_keys = getattr(self.model, "gpu_resident_buffer_keys", set())
+        # `_prepare_mm_inputs` (vllm gpu_model_runner) needs raw input_ids
+        # whenever the wrapped model runs its own `preprocess` per request.
+        # Thinker declares `requires_raw_input_tokens = True` as ClassVar;
+        # talker / code2wav do not, but we forward whatever the wrapped
+        # model reports so the runner does not silently pass None.
+        self.requires_raw_input_tokens = getattr(self.model, "requires_raw_input_tokens", False)
         if hasattr(self.model, "make_empty_intermediate_tensors"):
             self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 

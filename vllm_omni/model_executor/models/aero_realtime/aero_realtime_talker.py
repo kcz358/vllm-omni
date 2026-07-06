@@ -90,6 +90,10 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
         self.have_multimodal_outputs = True
         self.has_preprocess = True
         self.has_postprocess = True
+        # Talker.preprocess reads `input_ids.shape[0]` and calls `embed_input_ids(input_ids)`
+        # every step, so the runner must forward raw token ids (not None) via
+        # `_prepare_mm_inputs`.
+        self.requires_raw_input_tokens = True
         self.streaming_accumulated_keys: set[tuple[str, str]] = {
             ("hidden_states", "output"),
             ("codes", "audio"),
