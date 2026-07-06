@@ -206,6 +206,21 @@ _OMNI_MODELS = {
         "aero_realtime",
         "AeroRealtimeForConditionalGeneration",
     ),
+    "AeroRealtimeOmniForConditionalGeneration": (
+        "aero_realtime",
+        "aero_realtime_omni",
+        "AeroRealtimeOmniForConditionalGeneration",
+    ),
+    "AeroRealtimeTalkerForConditionalGeneration": (
+        "aero_realtime",
+        "aero_realtime_talker",
+        "AeroRealtimeTalkerForConditionalGeneration",
+    ),
+    "AeroRealtimeCode2Wav": (
+        "qwen3_tts",
+        "qwen3_tts_code2wav",
+        "Qwen3TTSCode2Wav",
+    ),
     # Alias: HF repo currently ships this architecture name in config.json
     "BailingMM2NativeForConditionalGeneration": (
         "ming_flash_omni",
