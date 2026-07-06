@@ -72,7 +72,6 @@ AERO_REALTIME_OMNI_PIPELINE = PipelineConfig(
             final_output_type="audio",
             hf_config_name="thinker_config",
             engine_output_type="audio",
-            model_arch="AeroRealtimeCode2Wav",
             custom_process_input_func=f"{_OMNI_PROC}.talker2code2wav",
             sampling_constraints={"detokenize": True},
         ),

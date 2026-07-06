@@ -225,6 +225,36 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
             return None
         return self.logits_processor(self.codec_head, hidden_states)
 
+    def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
+        """Pack talker forward output + code_predictor codes (from postprocess buffer)
+        into an OmniOutput so the runner's pooling_output carries `codes.audio` to
+        the downstream code2wav stage. Mirrors qwen3_omni.make_omni_output for the
+        talker branch.
+        """
+        if isinstance(model_outputs, OmniOutput):
+            return model_outputs
+
+        talker_hidden = model_outputs
+        multimodal_outputs: dict[str, Any] | None = None
+        info_dicts = kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information") or []
+        code_frames = []
+        num_groups = int(self.config.num_code_groups)
+        for info in info_dicts:
+            frame = (info.get("codes") or {}).get("audio") if isinstance(info, dict) else None
+            if not isinstance(frame, torch.Tensor):
+                continue
+            # Accept only single-step frames from postprocess: shape [1, num_groups].
+            # Placeholder / prewarm payloads may carry larger shapes and must be
+            # ignored here to avoid ragged stacking in the downstream chunker.
+            if frame.ndim == 2 and int(frame.shape[0]) == 1 and int(frame.shape[1]) == num_groups:
+                code_frames.append(frame)
+        if code_frames:
+            audio_codes = torch.cat(code_frames, dim=0)
+            multimodal_outputs = {"codes": {"audio": audio_codes}}
+            span_len = int(audio_codes.shape[0])
+            talker_hidden = talker_hidden[:span_len]
+        return OmniOutput(text_hidden_states=talker_hidden, multimodal_outputs=multimodal_outputs)
+
     def preprocess(
         self,
         input_ids: torch.Tensor,
