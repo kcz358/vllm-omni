@@ -14,6 +14,12 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.model_executor.models.interfaces import (
+    SupportsMRoPE,
+    SupportsMultiModal,
+    SupportsPP,
+    SupportsRealtime,
+)
 from vllm.model_executor.models.utils import init_vllm_registered_model, maybe_prefix
 
 from vllm_omni.transformers_utils.configs.aero_realtime_omni import (
@@ -24,7 +30,13 @@ from vllm_omni.transformers_utils.configs.aero_realtime_omni import (
 logger = init_logger(__name__)
 
 
-class AeroRealtimeOmniForConditionalGeneration(nn.Module):
+class AeroRealtimeOmniForConditionalGeneration(
+    nn.Module,
+    SupportsMultiModal,
+    SupportsPP,
+    SupportsMRoPE,
+    SupportsRealtime,
+):
     """Stage-dispatched wrapper for aero_realtime_omni.
 
     Stages:
@@ -69,9 +81,11 @@ class AeroRealtimeOmniForConditionalGeneration(nn.Module):
                 architectures=["AeroRealtimeTalkerForConditionalGeneration"],
             )
         elif model_stage == "code2wav":
-            # Reuse Qwen3TTSCode2Wav as-is; speech_tokenizer/ dir is expected to
-            # sit next to the checkpoint (user manually cp'd from Qwen3-TTS base).
-            # The vllm_config.model_config.model path is what Qwen3TTSCode2Wav uses.
+            # Qwen3TTSCode2Wav ignores hf_config and loads its weights from
+            # `<model_path>/speech_tokenizer/`; we pass thinker_config only as
+            # a required-but-unused placeholder. The user copies the
+            # speech_tokenizer/ folder from the Qwen3-TTS-Base checkpoint into
+            # the aero_realtime_omni checkpoint before deployment.
             code2wav_vllm_config = vllm_config.with_hf_config(
                 top_config.thinker_config,
                 architectures=["Qwen3TTSCode2Wav"],
@@ -85,7 +99,6 @@ class AeroRealtimeOmniForConditionalGeneration(nn.Module):
         else:
             raise ValueError(f"Invalid model_stage: {model_stage!r}. Must be thinker | talker | code2wav")
 
-        # Delegate common attributes.
         self.have_multimodal_outputs = getattr(self.model, "have_multimodal_outputs", False)
         self.has_preprocess = getattr(self.model, "has_preprocess", False)
         self.has_postprocess = getattr(self.model, "has_postprocess", False)
@@ -94,10 +107,22 @@ class AeroRealtimeOmniForConditionalGeneration(nn.Module):
         if hasattr(self.model, "make_empty_intermediate_tensors"):
             self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
-    # Delegate every vLLM-visible method to self.model.
+    def embed_input_ids(self, input_ids: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids, **kwargs)
 
-    def embed_input_ids(self, input_ids: torch.Tensor, **kw: Any) -> torch.Tensor:
-        return self.model.embed_input_ids(input_ids, **kw)
+    def embed_multimodal(self, **kwargs: Any):
+        if hasattr(self.model, "embed_multimodal"):
+            return self.model.embed_multimodal(**kwargs)
+        raise AttributeError(
+            f"stage={self.model_stage!r} submodule has no embed_multimodal"
+        )
+
+    def get_mrope_input_positions(self, *args: Any, **kwargs: Any):
+        if hasattr(self.model, "get_mrope_input_positions"):
+            return self.model.get_mrope_input_positions(*args, **kwargs)
+        raise AttributeError(
+            f"stage={self.model_stage!r} submodule has no get_mrope_input_positions"
+        )
 
     def forward(self, *args, **kwargs):
         return self.model.forward(*args, **kwargs)
@@ -106,9 +131,7 @@ class AeroRealtimeOmniForConditionalGeneration(nn.Module):
         return self.model.compute_logits(*args, **kwargs)
 
     def make_omni_output(self, *args, **kwargs):
-        if hasattr(self.model, "make_omni_output"):
-            return self.model.make_omni_output(*args, **kwargs)
-        raise AttributeError("submodule has no make_omni_output")
+        return self.model.make_omni_output(*args, **kwargs)
 
     def preprocess(self, *args, **kwargs):
         return self.model.preprocess(*args, **kwargs)
@@ -142,7 +165,6 @@ class AeroRealtimeOmniForConditionalGeneration(nn.Module):
 
         return self.model.load_weights(_filter())
 
-    # For SupportsRealtime protocol used by the current aero pipeline; delegate.
     @classmethod
     async def buffer_realtime_omni(cls, *args, **kwargs):
         from vllm_omni.model_executor.models.aero_realtime.aero_realtime import (
