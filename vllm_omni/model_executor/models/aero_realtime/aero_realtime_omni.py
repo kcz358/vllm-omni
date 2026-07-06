@@ -141,18 +141,22 @@ class AeroRealtimeOmniForConditionalGeneration(
         return self.model.embed_input_ids(input_ids, **kwargs)
 
     def embed_multimodal(self, **kwargs: Any):
+        # Only the thinker consumes raw audio/video/image inputs. Talker and
+        # code2wav stages inherit `SupportsMultiModal` at the class level (needed
+        # for the shared @MULTIMODAL_REGISTRY.register_processor decorator to
+        # attach a `_processor_factory` for the thinker path), but they never
+        # process mm inputs. Return an empty list so `profile_run` treats these
+        # stages as embedding-only.
         if hasattr(self.model, "embed_multimodal"):
             return self.model.embed_multimodal(**kwargs)
-        raise AttributeError(
-            f"stage={self.model_stage!r} submodule has no embed_multimodal"
-        )
+        return []
 
     def get_mrope_input_positions(self, *args: Any, **kwargs: Any):
+        # M-RoPE positions only apply to the thinker (vision + audio + text).
+        # For talker/code2wav return None; vllm falls back to 1-D positions.
         if hasattr(self.model, "get_mrope_input_positions"):
             return self.model.get_mrope_input_positions(*args, **kwargs)
-        raise AttributeError(
-            f"stage={self.model_stage!r} submodule has no get_mrope_input_positions"
-        )
+        return None
 
     def forward(self, *args, **kwargs):
         return self.model.forward(*args, **kwargs)
