@@ -1196,7 +1196,15 @@ class AeroRealtimeOmniForConditionalGeneration(
         return self.model.compute_logits(*args, **kwargs)
 
     def make_omni_output(self, *args, **kwargs):
-        return self.model.make_omni_output(*args, **kwargs)
+        # Only the thinker defines its own make_omni_output. Talker returns a
+        # plain hidden tensor and does not need the wrapping (its postprocess
+        # / stage_input_processor handle sampling + code_predictor); code2wav
+        # produces waveform samples directly. In those cases forward the
+        # unwrapped tensor so the runner keeps a reference for downstream
+        # sampling / connector logic.
+        if hasattr(self.model, "make_omni_output"):
+            return self.model.make_omni_output(*args, **kwargs)
+        return args[0] if args else None
 
     def preprocess(self, *args, **kwargs):
         return self.model.preprocess(*args, **kwargs)
