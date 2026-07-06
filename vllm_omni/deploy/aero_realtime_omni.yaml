@@ -33,6 +33,7 @@ stages:
     gpu_memory_utilization: 0.6
     enforce_eager: true
     devices: "1"
+    skip_mm_profiling: true
     input_connectors:
       from_stage_0: connector_of_shared_memory
     default_sampling_params:
@@ -48,6 +49,7 @@ stages:
     async_scheduling: false
     max_num_batched_tokens: 51200
     devices: "1"
+    skip_mm_profiling: true
     input_connectors:
       from_stage_1: connector_of_shared_memory
     default_sampling_params:
