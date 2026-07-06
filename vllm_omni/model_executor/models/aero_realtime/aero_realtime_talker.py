@@ -81,8 +81,6 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
         super().__init__()
         self.vllm_config = vllm_config
         top_config = vllm_config.model_config.hf_config
-        # top_config may be either AeroRealtimeOmniConfig or AeroRealtimeTalkerConfig,
-        # depending on whether we are hosted by the omni dispatcher or loaded standalone.
         if isinstance(top_config, AeroRealtimeOmniConfig):
             self.config: AeroRealtimeTalkerConfig = top_config.talker_config
         else:
@@ -92,11 +90,7 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
         self.have_multimodal_outputs = True
         self.has_preprocess = True
         self.has_postprocess = True
-        # Runner auto-concatenates these keys across streaming chunks. `embed.prefill`
-        # is provided by the thinker as thinker-side word-embeddings at audio_pad
-        # positions (informational; not consumed by preprocess).
         self.streaming_accumulated_keys: set[tuple[str, str]] = {
-            ("embed", "prefill"),
             ("hidden_states", "output"),
             ("codes", "audio"),
             ("codes", "past_group0"),
@@ -127,9 +121,6 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(talker_config.vocab_size)
         self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
-        # Text projection: thinker hidden -> talker hidden.
-        # fc1 in=thinker_hidden_size (2560), fc1 out=text_hidden_size (2048).
-        # fc2 in=text_hidden_size (2048), fc2 out=hidden_size (1024).
         self.text_projection = AeroRealtimeTalkerResizeMLP(
             input_size=talker_config.thinker_hidden_size,
             intermediate_size=talker_config.text_hidden_size,
@@ -158,6 +149,8 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
         self._cp_vllm_config = cp_vllm_config
 
         # Cache tokens we need often as buffers (avoid CPU->GPU per step).
+        if not talker_config.speaker_id:
+            raise ValueError("talker_config.speaker_id must have at least one entry")
         speaker_id = int(next(iter(talker_config.speaker_id.values())))
         cond_ids = torch.tensor(
             [talker_config.codec_bos_id, talker_config.codec_nothink_id, speaker_id],
@@ -200,8 +193,9 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
 
         Prefill branch (span_len > 1): rebuild the full prompt [cond(3) + body(N_total)]
         every chunk since stage-1 KV is cleared per streaming update.
-        Decode branch (span_len == 1): assemble the per-step input using the previous
-        step's `hidden_states.last` and the last-sampled group0 from postprocess.
+        Decode branch (span_len == 1): use the most recent row of accumulated
+        ``hidden_states.output`` and the most recent sampled group-0 code from
+        ``codes.past_group0`` to build one new body slot.
         """
         additional_information = info_dict.get("additional_information")
         if isinstance(additional_information, dict):
@@ -310,7 +304,12 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
         sampled_token_ids: torch.Tensor | None = None,
         **info_dict: Any,
     ) -> dict[str, Any]:
-        """After trunk produces last hidden + group0 is sampled, run the nested code_predictor AR."""
+        """Run the nested 15-step code_predictor AR after group-0 is sampled.
+
+        The ``sampled_token_ids is None`` branch is used during profiling / warmup
+        when no logits are available; end-to-end streaming always passes the
+        sampled group-0 id via the runner's postprocess hook (Task 6 wires this).
+        """
         talker_cfg = self.config
         if hidden_states is None or hidden_states.numel() == 0:
             return {}
