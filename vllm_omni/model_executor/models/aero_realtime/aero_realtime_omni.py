@@ -36,9 +36,21 @@ from vllm_omni.transformers_utils.configs.aero_realtime_omni import (
 logger = init_logger(__name__)
 
 
+class AeroRealtimeOmniProcessingInfo(AeroRealtimeProcessingInfo):
+    """Processing info for the omni dispatcher.
+
+    Unwraps ``AeroRealtimeOmniConfig`` → ``thinker_config`` (an
+    ``AeroRealtimeConfig``) so all downstream processor logic keeps working
+    unchanged.
+    """
+
+    def get_hf_config(self):
+        return self.ctx.get_hf_config(AeroRealtimeOmniConfig).thinker_config
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     AeroRealtimeMultiModalProcessor,
-    info=AeroRealtimeProcessingInfo,
+    info=AeroRealtimeOmniProcessingInfo,
     dummy_inputs=AeroRealtimeDummyInputsBuilder,
 )
 class AeroRealtimeOmniForConditionalGeneration(
