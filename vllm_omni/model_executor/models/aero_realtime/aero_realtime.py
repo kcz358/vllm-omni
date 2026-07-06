@@ -387,6 +387,10 @@ class AeroRealtimeForConditionalGeneration(
             "model.audio_tower.norm.": "audio_tower.layer_norm.",
             "audio_tower.norm.": "audio_tower.layer_norm.",
             "model.audio_tower.layers.": "audio_tower.layers.",
+            # LM head lives under language_model in Qwen3LLMForCausalLM. Kept
+            # last so the "language_model." rule above does not re-catch the
+            # rewritten prefix (WeightsMapper applies rules in insertion order).
+            "lm_head.": "language_model.lm_head.",
         },
     )
 
