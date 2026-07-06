@@ -1010,7 +1010,6 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.models.interfaces import (
     SupportsMRoPE,
     SupportsMultiModal,
@@ -1180,14 +1179,15 @@ class AeroRealtimeOmniForConditionalGeneration(
 
     def get_mrope_input_positions(self, *args: Any, **kwargs: Any):
         # M-RoPE positions only apply to the thinker (vision + audio + text).
-        # For talker/code2wav delegate to plain 1-D positions via
-        # `MRotaryEmbedding.get_input_positions_tensor` so the runner still
-        # gets a valid (positions, delta) tuple (matches qwen3_omni).
         if hasattr(self.model, "get_mrope_input_positions"):
             return self.model.get_mrope_input_positions(*args, **kwargs)
-        # Drop kwargs that the base rope helper does not accept.
-        kwargs.pop("mm_features", None)
-        return MRotaryEmbedding.get_input_positions_tensor(*args, **kwargs)
+        # Talker/code2wav: emit plain 1-D positions broadcast to 3 rows so the
+        # runner's mrope buffers accept them. Delta = 0. This matches the
+        # non-vision branch of the thinker's own implementation.
+        input_tokens = args[0] if args else kwargs.get("input_tokens")
+        seq_len = len(input_tokens)
+        positions = torch.arange(seq_len, dtype=torch.long).view(1, -1).expand(3, -1)
+        return positions.clone(), 0
 
     def forward(self, *args, **kwargs):
         return self.model.forward(*args, **kwargs)
