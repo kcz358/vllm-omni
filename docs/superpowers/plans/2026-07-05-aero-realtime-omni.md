@@ -45,6 +45,8 @@ Modified files:
 - Create: `vllm_omni/transformers_utils/configs/aero_realtime_omni.py`
 - Verify: `vllm_omni/transformers_utils/configs/aero_realtime.py` (unchanged — imported here)
 
+**Note on rope storage (transformers 5+):** `PretrainedConfig.rope_scaling` is a property whose getter/setter is aliased to `self.rope_parameters` (see `transformers/configuration_utils.py` lines ~482-488 in v5.8.1). We store rope config **only** in `self.rope_parameters`; reads of `self.rope_scaling` transparently return the same dict via the property. Writing to both would be a no-op at best and a silent shared-reference bug at worst.
+
 - [ ] **Step 1: Create the file with three config classes**
 
 Write `/data/v-kaichen/vllm-omni/vllm_omni/transformers_utils/configs/aero_realtime_omni.py`:
@@ -107,13 +109,10 @@ class AeroRealtimeTalkerCodePredictorConfig(PretrainedConfig):
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.rope_theta = rope_theta
-        # Support both `rope_scaling` (old) and `rope_parameters` (new, transformers>=5).
         if rope_parameters is not None:
             self.rope_parameters = rope_parameters
-            self.rope_scaling = rope_scaling if rope_scaling is not None else rope_parameters
         else:
             self.rope_parameters = rope_scaling or {"rope_type": "default", "rope_theta": rope_theta}
-            self.rope_scaling = rope_scaling
         self.sliding_window = sliding_window
         self.num_code_groups = num_code_groups
         self.initializer_range = initializer_range
@@ -178,22 +177,17 @@ class AeroRealtimeTalkerConfig(PretrainedConfig):
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.rope_theta = rope_theta
-        # Aero uses interleaved mrope with sections [24, 20, 20] summing to head_dim/2 = 64.
         if rope_parameters is not None:
             self.rope_parameters = rope_parameters
-            self.rope_scaling = rope_scaling if rope_scaling is not None else rope_parameters
         elif rope_scaling is not None:
             self.rope_parameters = rope_scaling
-            self.rope_scaling = rope_scaling
         else:
-            default_rope = {
+            self.rope_parameters = {
                 "rope_type": "default",
                 "rope_theta": rope_theta,
                 "mrope_section": [24, 20, 20],
                 "interleaved": True,
             }
-            self.rope_parameters = default_rope
-            self.rope_scaling = default_rope
         self.sliding_window = sliding_window
         self.num_code_groups = num_code_groups
         self.thinker_hidden_size = thinker_hidden_size
@@ -240,12 +234,11 @@ class AeroRealtimeOmniConfig(PretrainedConfig):
 
         # Convenience: expose thinker text hidden_size at top level (some vllm code paths
         # read config.hidden_size directly).
-        self.hidden_size = getattr(thinker_config.text_config, "hidden_size", None)
+        self.hidden_size = getattr(getattr(thinker_config, "text_config", None), "hidden_size", None)
 
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
     def get_text_config(self, **kwargs):
-        # vLLM expects text config to expose hidden_size / num_attention_heads.
         return self.thinker_config.text_config
 
 
