@@ -1,6 +1,13 @@
 # Aero Realtime Omni — Design Spec
 
-**Status:** Draft, awaiting user review
+**Status:** End-to-end pipeline works on the reference checkpoint. `async_chunk: false`
+(sync-forward) mode: every audio chunk is a fresh stage-1 request; the talker's `forward`
+runs the 15-step residual `code_predictor` inline and packs the resulting codec frame
+into `OmniOutput.multimodal_outputs["codes"]["audio"]`, which the runner forwards to
+stage-2 via `talker2code2wav`. Verified on the 30 s Charades video with 373 text tokens
++ 374 audio deltas producing **29.84 s** of speech-shaped waveform (dynamic RMS across
+the timeline, peak near full-scale — not the constant-amplitude bogus wav we saw in
+`async_chunk: true` mode).
 **Date:** 2026-07-05
 **Author:** OpenCode
 **Reference implementation:** `/data/v-kaichen/lmms-engine/src/lmms_engine/models/aero_realtime_omni/`
@@ -120,14 +127,38 @@ using the accumulated `hidden_states.output` from the thinker. `streaming_accumu
 the concatenation transparently. Cost is O(N²) with respect to session length, but matches training
 semantics exactly and avoids modifying the core scheduler.
 
-### D2: code predictor runs inside the talker's `postprocess` hook
+**Sync-forward transport (`async_chunk: false`).** Rather than the async-chunk / shared-memory
+transport, the pipeline runs orchestrator sync forwarding — every time stage-0 produces a token,
+`_forward_to_next_stage` submits a **fresh** stage-1 request whose prompt payload is the newly-
+accumulated hidden. Because each request lives for exactly one `forward` call, the talker does
+not need `resumable=True` and there is no long-lived talker session to manage. The `thinker2talker`
+processor casts the hidden tensor from bfloat16 to float32 for wire serialization (numpy has no
+bfloat16); the talker preprocess casts it back to bfloat16 for the trunk model.
 
-The 15-step residual AR is a nested loop within a single trunk decode step. vLLM's scheduler cannot
-express nested AR, so we run it as a plain torch loop inside `AeroRealtimeTalkerForConditionalGeneration.postprocess`,
-matching `Qwen3OmniMoeTalkerForConditionalGeneration`'s pattern (`talker_postprocess` in
-`qwen3_omni.py:643`). Sampled `group0_id` comes from `additional_information` provided by the sampler;
-the postprocess writes the resulting `[group0, ..., group15]` frame back into
-`additional_information.codes.audio` and appends to the running per-request codec accumulator.
+### D2: code predictor runs inside the talker's `forward`
+
+The 15-step residual AR is a nested loop within a single trunk decode step. In sync-forward mode
+every talker call is a one-shot prefill + sample-and-emit, so we can (and must) produce the whole
+codec frame inline:
+
+1. `hidden = self.model(inputs_embeds=prompt_embeds)`
+2. `group0_id = argmax(logits_processor(codec_head, hidden[-1:, :]))`
+3. `frame = code_predictor(layer0_code=group0_id, layer0_embed, last_talker_hidden, **subtalker_sampling_params)  # [1, num_code_groups]`
+4. `return OmniOutput(text_hidden_states=hidden, multimodal_outputs={"codes": {"audio": frame}})`
+
+The runner's `extract_multimodal_outputs` then puts `codes.audio` into pooling_output, which the
+downstream `talker2code2wav` processor reshapes into a codebook-major flat sequence for stage-2
+code2wav. **`postprocess` therefore only caches `hidden_states.last`** (kept for parity with the
+qwen3_tts talker contract in case a future optimization wants to warm-start from it).
+
+The runner still runs `compute_logits + sample` after `forward` — that copy of the sampled
+group-0 id feeds `sampled_token_ids` (used for stop-token 2150 detection) and is **not** fed
+back into `code_predictor` because the frame is already produced. This intentionally duplicates
+one codec_head + argmax per step (~ms scale, negligible).
+
+The `subtalker_sampling_params` block on the stage-1 yaml (`do_sample`, `temperature`, `top_k`,
+`top_p`) overrides the code_predictor sampling knobs; falls back to the training-time defaults
+`(True, 0.9, 50, 1.0)` when unset. Same pattern as qwen3_tts talker.
 
 ### D3: new model_type `aero_realtime_omni`, existing `aero_realtime` unchanged
 
@@ -197,18 +228,22 @@ stage 1 loads the ~0.6B talker on GPU 1; stage 2 loads the code2wav on GPU 1.
 For each incoming chunk (80 ms audio + optional video/text):
 
 1. **Stage 0 thinker.** `buffer_realtime_omni` yields an `OmniTokensPrompt` with prompt_token_ids
-   ending in `[..., <|audio_pad|>×4]`, plus audio mm data. Scheduler appends the 4 pad tokens to the
-   existing KV. Thinker `forward` returns
-   `(last_hidden_states, {"hidden_states":{"output":<H at 4 audio_pad positions>},"embed":{"prefill":<word_embeds of the 4 pad ids>}})`.
-   Sampler samples 1 text token (`<|rt_pad|>` if user is not speaking yet).
+   ending in exactly **one** `<|audio_pad|>` slot per audio chunk (see
+   `AeroRealtimeForConditionalGeneration._build_realtime_delta`, comment: "audio stays single
+   slot per chunk (spec I1+I5)"). Scheduler appends the 1 pad token to the existing KV. Thinker
+   `forward` returns
+   `(last_hidden_states, {"hidden_states":{"output":<H at the 1 audio_pad position>},"embed":{"prefill":<word_embed of the pad id>}})`.
+   Sampler samples 1 text token (`<|rt_pad|>` if user is not speaking yet, else a real answer
+   token). Aero thinker uses `realtime_max_tokens=1` and `SupportsRealtime`.
 
-2. **Producer hook `thinker2talker_async_chunk`.** Reads pooling output; emits payload with the 4 new
-   frames' hidden_states.output + embed.prefill. Ships to stage 1.
+2. **Producer hook `thinker2talker_async_chunk`.** Reads pooling output; emits payload with the 1 new
+   frame's hidden_states.output + embed.prefill. Ships to stage 1.
 
 3. **Stage 1 scheduler.** `_replace_session_with_streaming_update` clears the talker KV, replaces
    `prompt_token_ids` with the new full-length placeholder (length = 3 + N_total_frames, where
-   N_total_frames is the sum across all chunks so far), and resets `num_computed_tokens = 0`. Runner
-   auto-concatenates `hidden_states.output` and `embed.prefill` across chunks.
+   N_total_frames is the count of audio_pad slots seen so far — one per chunk), and resets
+   `num_computed_tokens = 0`. Runner auto-concatenates `hidden_states.output` and `embed.prefill`
+   across chunks.
 
 4. **Stage 1 talker `preprocess()` (prefill branch, span_len > 1).** Constructs the trunk prompt
    from the accumulated hidden states:
@@ -225,18 +260,29 @@ For each incoming chunk (80 ms audio + optional video/text):
    At the *last* body slot, prev_group0 is the group-0 that was sampled at the *previous* chunk;
    for the very first chunk it's `codec_bos_id`.
 
-5. **Stage 1 talker `forward()`.** Runs `self.model(inputs_embeds=prompt_embeds)`, gets last hidden
-   at index `3+N_total-1`, then `compute_logits → codec_head(last_hidden)` returns group-0 logits.
-   Sampler samples `group0_new` and passes it back to the runner.
+5. **Stage 1 talker `forward()`.** Runs `self.model(inputs_embeds=prompt_embeds)` to get the
+   trunk hidden `[3+N_total, hidden]`. **The 15-step residual `code_predictor` runs inline
+   here**: greedy-argmax `codec_head(last_hidden) → group0_id`, then
+   `code_predictor(layer0_code=group0_id, layer0_embed, last_talker_hidden, do_sample=True,
+   temperature=0.9, top_k=50, top_p=1.0) → [1, num_code_groups] frame`. Return
+   `OmniOutput(text_hidden_states=hidden, multimodal_outputs={"codes": {"audio": frame}})` so
+   the runner's `extract_multimodal_outputs` puts the codec frame into pooling_output.
+   Sampler still runs `compute_logits(hidden) → sample` independently — that copy of the
+   sampled group-0 id feeds the `sampled_token_ids` stream (used for stop-token 2150 detection)
+   and is intentionally not fed back into `code_predictor` (the frame we just packed already
+   contains a group-0 derived from the same hidden). The `subtalker_sampling_params` in the
+   deploy yaml (stage 1) overrides the `code_predictor` sampling knobs.
 
-6. **Stage 1 talker `postprocess(last_hidden, sampled_id=group0_new)`.**
-   - Nested loop: `code_predictor.generate(inputs_embeds=[last_hidden; codec_embedding(group0_new)], max_new_tokens=15)`
-     returns `[group1, ..., group15]`.
-   - Writes `[group0_new, group1, ..., group15]` into `additional_information.codes.audio[N_total-1]`.
-   - Saves `last_hidden` under `hidden_states.last` for the next decode step within this chunk.
+6. **Stage 1 talker `postprocess(hidden)`.** Reduced to caching `hidden_states.last` for
+   potential future warm-start use. Since `sync_mode` makes every chunk a fresh stage-1
+   request, nothing else needs to persist across calls; the codec frame produced in step 5
+   already left the model through `pooling_output`.
 
-7. **Steps 4-6 repeat** for each decode step within this chunk (there may be several `<|audio_pad|>`
-   slots per streaming chunk — 4 in the current aero timing).
+7. **1:1 lockstep with thinker.** Exactly one audio_pad slot per chunk → exactly one stage-1
+   request per chunk → exactly one `forward` (which internally produces one codec frame) per
+   chunk. Talker `max_tokens=1`; no `resumable=True` needed since orchestrator
+   `_forward_to_next_stage` submits a fresh request every time stage-0 finishes its
+   `max_tokens=1` step.
 
 8. **Producer hook `talker2code2wav_async_chunk`.** Reads the newly-emitted codec frames; buffers
    them until `codec_chunk_frames=25` (config in `aero_realtime_omni.yaml`) is reached; flushes 25
@@ -264,6 +310,17 @@ The user's `async for output in omni.generate(...):` sees:
   `speech_tokenizer/` into the aero checkpoint. Documented in the README of the offline example.
 - **`realtime_max_tokens=1`:** kept from the current aero thinker. The talker is not `SupportsRealtime`
   and does not need this field — it's not scheduled via the vLLM realtime WebSocket path.
+
+- **Talker request lifecycle across chunks (RESOLVED via sync-forward mode).** The pipeline
+  uses `async_chunk: false` so orchestrator `_forward_to_next_stage` submits a fresh stage-1
+  request every time stage-0 finishes its 1-token step. Each talker request lives for exactly
+  one `forward` call; `resumable=True` is not needed on stage-1/2. This intentionally
+  side-steps the async_chunk path, which would have required a long-lived talker session
+  reset via `_replace_session_with_streaming_update` on every incoming chunk (and prewarm
+  would have needed `resumable=True`). The tradeoff is per-chunk request setup overhead
+  (~ms) instead of per-chunk KV reuse; acceptable given talker's O(N²) full re-prefill per
+  D1 anyway.
+
 - **Concurrent requests:** single-request first. Multi-request talker state isolation is a follow-up.
 - **CUDA graph:** disabled in stage 1/2 (enforce_eager=true in yaml) for the first iteration.
 

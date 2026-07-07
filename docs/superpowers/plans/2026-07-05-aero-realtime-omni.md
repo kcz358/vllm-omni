@@ -2,6 +2,31 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+## Current status (2026-07-06)
+
+- **End-to-end works.** Sync-forward transport (`async_chunk: false`), stage-0 thinker streams
+  one `[token]` per 80 ms audio chunk (`<|rt_pad|>` while the user is silent, real answer tokens
+  once the utterance starts), stage-1 talker forward runs the 15-step code_predictor inline and
+  ships the resulting codec frame through `OmniOutput.multimodal_outputs["codes"]["audio"]`,
+  stage-2 code2wav decodes to 24 kHz PCM. Verified on the 30 s Charades video with the
+  reference checkpoint: **373 text tokens + 374 audio deltas → 29.84 s wav** with dynamic RMS
+  variation and peak near full-scale (real speech waveform, not the constant-amplitude bogus
+  wav we saw when the code_predictor sampling loop was uncontrolled).
+- **What made it work.** Three linked design pivots after the earlier `async_chunk: true`
+  attempt kept failing on chunk-adapter lifecycle:
+  1. Switch to sync-forward (`async_chunk: false`). Orchestrator's `_forward_to_next_stage`
+     spins up a fresh stage-1 request per stage-0 token step, so we don't need `resumable`
+     support for downstream stages.
+  2. Run the 15-step residual `code_predictor` inline in `AeroRealtimeTalker.forward` and
+     return `OmniOutput(multimodal_outputs={"codes": {"audio": frame}})`. Postprocess is
+     reduced to caching `hidden_states.last`.
+  3. Wire `subtalker_sampling_params` from the deploy yaml (stage 1) into the talker's
+     `code_predictor` call — same pattern as qwen3_tts talker.
+- **Talker `max_tokens=1`** on the yaml — one codec frame per audio_pad slot, 1:1 lockstep
+  with the thinker.
+- **Numpy has no bfloat16** on the wire; `thinker2talker` casts hidden / embed to float32
+  before serialization, `talker.preprocess` casts back to bfloat16 for the trunk model.
+
 **Goal:** Add a new `aero_realtime_omni` 3-stage streaming pipeline (thinker → talker → code2wav) to vLLM-Omni, reusing the existing `aero_realtime` thinker unchanged and reusing `Qwen3TTSCode2Wav` as-is.
 
 **Architecture:** New stage-0 `AeroRealtimeForConditionalGeneration` (additive: hidden-state export). New stage-1 `AeroRealtimeTalkerForConditionalGeneration` (Qwen3-decoder trunk + text_projection + codec_head + Qwen3-TTS's reusable `CodePredictorWrapper`) that consumes accumulated thinker hidden states via `streaming_accumulated_keys`. Stage-2 is `Qwen3TTSCode2Wav` behind an alias. Per-chunk full re-prefill for the talker; nested 15-step code_predictor AR inside `talker.postprocess`. New model_type `aero_realtime_omni`; existing `aero_realtime` unchanged.
@@ -1785,7 +1810,7 @@ stages:
     default_sampling_params:
       temperature: 0.9
       top_k: 50
-      max_tokens: 4096
+      max_tokens: 1
       seed: 42
 
   - stage_id: 2
