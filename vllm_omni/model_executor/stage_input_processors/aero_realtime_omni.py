@@ -146,12 +146,15 @@ def thinker2talker(
 
         payload: OmniPayload = {
             "embed": {
-                "prefill": embed.detach().to("cpu")
+                # Serializer uses numpy which does not support bfloat16, so cast
+                # to float32 on the wire; talker preprocess casts back to
+                # bfloat16 for the trunk model.
+                "prefill": embed.detach().to("cpu", dtype=torch.float32)
                 if isinstance(embed, torch.Tensor)
                 else torch.empty(0)
             },
             "hidden_states": {
-                "output": hs.detach().to("cpu")
+                "output": hs.detach().to("cpu", dtype=torch.float32)
                 if isinstance(hs, torch.Tensor)
                 else torch.empty(0)
             },

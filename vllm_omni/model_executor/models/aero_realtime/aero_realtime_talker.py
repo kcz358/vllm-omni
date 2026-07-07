@@ -8,7 +8,7 @@ groups 1..15 from a nested code_predictor AR).
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 import torch
@@ -152,6 +152,14 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
             )
         self._cp_vllm_config = cp_vllm_config
 
+        # Per-model-config code_predictor sampling knobs (yaml
+        # ``subtalker_sampling_params`` at the talker stage). Falls back to the
+        # training-time defaults if the deploy yaml does not override.
+        raw_subtalker_sampling = getattr(vllm_config.model_config, "subtalker_sampling_params", None)
+        self._subtalker_sampling_params: dict[str, Any] = (
+            dict(raw_subtalker_sampling) if isinstance(raw_subtalker_sampling, Mapping) else {}
+        )
+
         # Cache tokens we need often as buffers (avoid CPU->GPU per step).
         if not talker_config.speaker_id:
             raise ValueError("talker_config.speaker_id must have at least one entry")
@@ -215,8 +223,45 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **_: Any,
-    ) -> torch.Tensor | IntermediateTensors:
-        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+    ) -> torch.Tensor | IntermediateTensors | OmniOutput:
+        hidden = self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+        if not isinstance(hidden, torch.Tensor):
+            # PP non-last rank returns IntermediateTensors; passthrough.
+            return hidden
+
+        # sync_mode 1:1 lockstep semantic: every forward corresponds to exactly one new
+        # codec frame (one audio_pad slot on the thinker side). We greedily sample
+        # group-0 from the last hidden and run the 15-step residual code_predictor
+        # inline so the resulting [1, num_code_groups] frame rides on
+        # multimodal_outputs["codes"]["audio"] to the downstream code2wav stage.
+        # The runner's sampler will independently sample another group-0 token from
+        # our compute_logits — that copy only feeds the sampled_token_ids stream
+        # (used for stop-token detection) and is intentionally not used for the
+        # code_predictor here to keep the model self-contained.
+        last_hidden = hidden[-1:, :].detach()
+        logits = self.logits_processor(self.codec_head, last_hidden)
+        if isinstance(logits, tuple):
+            logits = logits[0]
+        group0_id = logits.reshape(-1, logits.shape[-1]).argmax(dim=-1)[-1:].to(
+            dtype=torch.long, device=hidden.device
+        )
+        layer0_embed = self.embed_input_ids(group0_id).reshape(1, 1, -1)
+        past_hidden = last_hidden.reshape(1, 1, -1)
+        subtalker_params = self._subtalker_sampling_params
+        audio_codes = self.code_predictor(
+            layer0_code=group0_id.reshape(1, 1),
+            layer0_embed=layer0_embed,
+            last_talker_hidden=past_hidden,
+            do_sample=bool(subtalker_params.get("do_sample", True)),
+            temperature=float(subtalker_params.get("temperature", 0.9)),
+            top_k=int(subtalker_params.get("top_k", 50)),
+            top_p=float(subtalker_params.get("top_p", 1.0)),
+        )  # [1, num_code_groups]
+        frame = audio_codes.reshape(1, -1).to(dtype=torch.long)
+        return OmniOutput(
+            text_hidden_states=hidden,
+            multimodal_outputs={"codes": {"audio": frame}},
+        )
 
     def compute_logits(self, hidden_states, sampling_metadata=None) -> torch.Tensor | None:
         if isinstance(hidden_states, OmniOutput):
@@ -226,34 +271,15 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
         return self.logits_processor(self.codec_head, hidden_states)
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
-        """Pack talker forward output + code_predictor codes (from postprocess buffer)
-        into an OmniOutput so the runner's pooling_output carries `codes.audio` to
-        the downstream code2wav stage. Mirrors qwen3_omni.make_omni_output for the
-        talker branch.
+        """Identity wrapper. Talker.forward already returns an OmniOutput carrying
+        the codec frame in ``multimodal_outputs["codes"]["audio"]``; the runner's
+        ``extract_multimodal_outputs`` extracts it into pooling_output.
         """
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
-
-        talker_hidden = model_outputs
-        multimodal_outputs: dict[str, Any] | None = None
-        info_dicts = kwargs.get("model_intermediate_buffer") or kwargs.get("runtime_additional_information") or []
-        code_frames = []
-        num_groups = int(self.config.num_code_groups)
-        for info in info_dicts:
-            frame = (info.get("codes") or {}).get("audio") if isinstance(info, dict) else None
-            if not isinstance(frame, torch.Tensor):
-                continue
-            # Accept only single-step frames from postprocess: shape [1, num_groups].
-            # Placeholder / prewarm payloads may carry larger shapes and must be
-            # ignored here to avoid ragged stacking in the downstream chunker.
-            if frame.ndim == 2 and int(frame.shape[0]) == 1 and int(frame.shape[1]) == num_groups:
-                code_frames.append(frame)
-        if code_frames:
-            audio_codes = torch.cat(code_frames, dim=0)
-            multimodal_outputs = {"codes": {"audio": audio_codes}}
-            span_len = int(audio_codes.shape[0])
-            talker_hidden = talker_hidden[:span_len]
-        return OmniOutput(text_hidden_states=talker_hidden, multimodal_outputs=multimodal_outputs)
+        # Fallback for non-OmniOutput (e.g. warmup skipping code_predictor):
+        # return a bare wrapper so downstream code does not break.
+        return OmniOutput(text_hidden_states=model_outputs, multimodal_outputs=None)
 
     def preprocess(
         self,
@@ -376,56 +402,19 @@ class AeroRealtimeTalkerForConditionalGeneration(nn.Module):
         sampled_token_ids: torch.Tensor | None = None,
         **info_dict: Any,
     ) -> dict[str, Any]:
-        """Run the nested 15-step code_predictor AR after group-0 is sampled.
+        """Cache the last hidden state for the next chunk's preprocess.
 
-        The ``sampled_token_ids is None`` branch is used during profiling / warmup
-        when no logits are available; end-to-end streaming always passes the
-        sampled group-0 id via the runner's postprocess hook (Task 6 wires this).
+        The 15-step code_predictor now runs inside ``forward`` (sync-mode 1:1
+        lockstep design) so ``codes.audio`` for the current step already rides
+        on ``multimodal_outputs``. Postprocess only needs to keep
+        ``hidden_states.last`` around in case a subsequent step wants to warm-start
+        from it (currently unused by aero preprocess, but kept for parity with
+        the qwen3_tts talker contract).
         """
-        talker_cfg = self.config
         if hidden_states is None or hidden_states.numel() == 0:
             return {}
-
-        last_hidden = hidden_states[-1:, :].detach()  # [1, hidden]
-        if sampled_token_ids is None:
-            frame = torch.zeros(
-                (1, int(talker_cfg.num_code_groups)),
-                dtype=torch.long,
-                device=hidden_states.device,
-            )
-            return {
-                "hidden_states": {"last": last_hidden},
-                "codes": {
-                    "audio": frame,
-                    "past_group0": torch.zeros((1,), dtype=torch.long, device=hidden_states.device),
-                },
-            }
-
-        # sampled_token_ids: [1] on GPU, dtype long. This is group0 for the last frame.
-        group0_id = sampled_token_ids.reshape(-1)[-1:].to(dtype=torch.long, device=hidden_states.device)
-
-        # Nested 15-step code_predictor AR via CodePredictorWrapper.forward().
-        # The wrapper returns [B, num_groups] with layer0 at column 0 and residuals at 1..G-1.
-        layer0_embed = self.embed_input_ids(group0_id).reshape(1, 1, -1)
-        past_hidden = last_hidden.reshape(1, 1, -1)
-        audio_codes = self.code_predictor(
-            layer0_code=group0_id.reshape(1, 1),
-            layer0_embed=layer0_embed,
-            last_talker_hidden=past_hidden,
-            do_sample=True,
-            temperature=0.9,
-            top_k=50,
-            top_p=1.0,
-        )  # [1, num_code_groups]
-        frame = audio_codes.reshape(1, -1).to(dtype=torch.long)
-
-        return {
-            "hidden_states": {"last": last_hidden},
-            "codes": {
-                "audio": frame,
-                "past_group0": group0_id.reshape(1),
-            },
-        }
+        last_hidden = hidden_states[-1:, :].detach()
+        return {"hidden_states": {"last": last_hidden}}
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load talker.* weights.
