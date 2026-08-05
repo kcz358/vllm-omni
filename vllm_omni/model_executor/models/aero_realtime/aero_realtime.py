@@ -1156,9 +1156,13 @@ class AeroRealtimeForConditionalGeneration(
         }
         audio_params = dict(self.audio_tower.named_parameters())
         audio_loaded: set[str] = set()
+        direct_weights: list[tuple[str, torch.Tensor]] = []
         other_weights: list[tuple[str, torch.Tensor]] = []
 
         for name, w in weights:
+            if name.startswith("lm_head."):
+                direct_weights.append((f"language_model.{name}", w))
+                continue
             mapped = self.hf_to_vllm_mapper._map_name(name)
             if mapped is None:
                 continue
@@ -1182,8 +1186,9 @@ class AeroRealtimeForConditionalGeneration(
                 other_weights.append((name, w))
 
         loader = AutoWeightsLoader(self)
+        direct_loaded = loader.load_weights(direct_weights)
         other_loaded = loader.load_weights(other_weights, mapper=self.hf_to_vllm_mapper)
-        return other_loaded | audio_loaded
+        return direct_loaded | other_loaded | audio_loaded
 
     def get_mm_mapping(self) -> MultiModelKeys:
         return MultiModelKeys.from_string_field(
